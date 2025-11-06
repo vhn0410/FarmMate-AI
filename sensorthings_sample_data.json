@@ -1,0 +1,189 @@
+[
+    {
+        "id": 3,
+        "name": "Thiết bị đo dinh dưỡng đất cầm tay",
+        "description": "Thiết bị đo dinh dưỡng đất cầm tay (Handle device) gồm hộp xử lý tạo bởi vi điều kiển (esp32) cùng màn hình LCD, cùng cảm biến tích hợp 7 thông số rời bao gồm (độ pH, Nito (N), Kali (K), Photpho (P), Độ dẫn điện (EC), nhiệt độ đất, độ ẩm đất). Ngoài ra, với khả năng truyền dữ liệu qua wifi của vi điều kiển dữ liệu còn được lưu trữ lâu dài trên đám mây.",
+        "properties": {
+            "user_id": "a2ecd084-3013-4a15-836c-9c0b7be0b320"
+        },
+        "sensors": [
+            {
+                "id": 4,
+                "name": "Cảm biến đo đất tích hợp 7 thông số (LoRaWAN 7-In-1 Soil Sensor)",
+                "description": "Cảm biến tích hợp 7 thông số rời bao gồm (độ pH, Nito (N), Kali (K), Photpho (P), Độ dẫn điện (EC), nhiệt độ đất, độ ẩm đất)",
+                "encodingType": "application\/pdf",
+                "metadata": "https://www.scribd.com/document/905261143/LoRaWAN-7-In-1-Soil-Sensor-Moisture-Conductivity-Temperature-NPK-PH",
+                "datastreams": [
+                    {
+                        "id": 10,
+                        "name": "Temperature",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "Luồng dữ liệu này lưu trữ giá trị đo về nhiệt độ đất của cảm biến",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 4,
+                                "name": "Nhiệt độ",
+                                "definition": "Nhiệt độ",
+                                "description": "Nhiệt độ"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 1,
+                                "name": "Độ C",
+                                "symbol": "\u00b0C",
+                                "definition": "http:\/\/unitsofmeasure.org\/ucum.html#para-30"
+                            }
+                        ]
+                    },
+                    {
+                        "id": 9,
+                        "name": "Moisture",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "Luồng dữ liệu này lưu trữ giá trị đo về độ ẩm đất của cảm biến",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 3,
+                                "name": "Độ ẩm",
+                                "definition": "Độ ẩm",
+                                "description": "Độ ẩm"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 2,
+                                "name": "phần trăm",
+                                "symbol": "%",
+                                "definition": "http:\/\/unitsofmeasure.org\/ucum.html#para-29"
+                            }
+                        ]
+                    },
+                    {
+                        "id": 8,
+                        "name": "EC",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "Độ dẫn điện (EC)",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 9,
+                                "name": "EC",
+                                "definition": "Độ dẫn điện (EC)",
+                                "description": "Độ dẫn điện (EC)"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 5,
+                                "name": "\u00b5S\/cm",
+                                "symbol": "\u00b5S\/cm",
+                                "definition": "\u00b5S\/cm"
+                            }
+                        ]
+                    },
+                    {
+                        "id": 7,
+                        "name": "Potassium",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "Potassium - Kali - K",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 8,
+                                "name": "Kali",
+                                "definition": "Kali",
+                                "description": "Kali"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 4,
+                                "name": "mg\/kg",
+                                "symbol": "mg\/kg",
+                                "definition": "mg\/kg"
+                            }
+                        ]
+                    },
+                    {
+                        "id": 6,
+                        "name": "Phosphorus",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "Phosphorus - Phốt pho - Phót pho - P",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 7,
+                                "name": "Phosphorus",
+                                "definition": "Phosphorus",
+                                "description": "Phosphorus"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 4,
+                                "name": "mg\/kg",
+                                "symbol": "mg\/kg",
+                                "definition": "mg\/kg"
+                            }
+                        ]
+                    },
+                    {
+                        "id": 5,
+                        "name": "Nitrogen",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "Nitrogen - Ni tơ - Nito - N",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 6,
+                                "name": "Nitrogen",
+                                "definition": "Nito",
+                                "description": "Nito"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 4,
+                                "name": "mg\/kg",
+                                "symbol": "mg\/kg",
+                                "definition": "mg\/kg"
+                            }
+                        ]
+                    },
+                    {
+                        "id": 4,
+                        "name": "pH",
+                        "thingId": 3,
+                        "sensorId": 4,
+                        "description": "pH",
+                        "observationType": 4,
+                        "observedproperties": [
+                            {
+                                "id": 5,
+                                "name": "pH",
+                                "definition": "pH",
+                                "description": "pH"
+                            }
+                        ],
+                        "measurementunits": [
+                            {
+                                "id": 3,
+                                "name": "H+",
+                                "symbol": "H+",
+                                "definition": "H+"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+]

@@ -1,0 +1,39 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+# Virtual environment
+venv/
+.env/
+.venv/
+
+# Logs, temp files
+*.log
+*.tmp
+
+# Bytecode / cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Environment files
+.env
+.env.local
+
+chunks.duckdb
