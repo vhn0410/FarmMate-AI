@@ -1,87 +1,97 @@
-
 from src.tools.knowledge_base_tool import KnowledgeBaseService, build_kb_tool
 from src.tools.sensorthings_tool import sensorthings_search
-from langchain_core.messages import HumanMessage, AIMessageChunk, ToolMessage, SystemMessage
-from langgraph.graph import add_messages, StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from typing import TypedDict, Annotated, Optional, List, Dict, Any
+from typing import TypedDict, Annotated, Literal
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 import json
+from functools import partial
+
 load_dotenv()
-
-
 
 # --------------------------
 # Memory & Graph State
 # --------------------------
 memory = MemorySaver()
 
+def add_messages(left, right):
+    """Custom reducer to prevent message duplication"""
+    if not isinstance(left, list):
+        left = [left]
+    if not isinstance(right, list):
+        right = [right]
+    return left + right
+
 class State(TypedDict):
     messages: Annotated[list, add_messages]
+    sensor_data: dict  # Store parsed sensor data
+    kb_context: str    # Store KB context
 
+# --------------------------
+# Workflow class
+# --------------------------
 class Workflow:
-    retriever = None  # inject từ ngoài
-    def __init__(self, retriever):
+    def __init__(self, retriever, llm, llm_router):
         self.retriever = retriever
-   
+        self.llm = llm
+        self.llm_router = llm_router
+        
+        # Bind tools
+        self.knowledge_base = KnowledgeBaseService(self.retriever)
+        self.search_knowledge_base = build_kb_tool(self.knowledge_base)
+        self.llm_with_tools = self.llm_router.bind_tools(
+            tools=[self.search_knowledge_base, sensorthings_search]
+        )
 
 # --------------------------
 # LLM setup
 # --------------------------
-# Choose whichever LLM is available in your env. We'll make two llms: one for planning/router (no tools) and one bound-to-tools.
-from langchain_openai import ChatOpenAI
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
-llm_router = ChatOpenAI(model="gpt-4o-mini", temperature=0)  # optional smaller router
-
-# Bind tools for the model that will do generation with tool-calls
-knowledge_base = KnowledgeBaseService(Workflow.retriever)
-search_knowledge_base = build_kb_tool(knowledge_base)
-llm_with_tools = llm_router.bind_tools(tools=[search_knowledge_base, sensorthings_search])
+llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
+llm_router = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 # --------------------------
-# Nodes: planner, tool_node, responder
+# Graph nodes
 # --------------------------
-async def planner(state: State):
-    """Planner decides whether to call tools and with what queries. 
-    It should NOT produce final user-facing answer - only tool calls.
-    Output: appended AI planning message (may include tool_calls).
-    """
-    # Build a short system prompt to the model
+async def planner(state: State, workflow: Workflow):
+    """Planner decides which tools to call based on query type."""
     system = SystemMessage(content=(
-        "You are a routing agent that analyzes user queries and decides which tools to call.\n\n"
-        "Rules:\n"
-        "- If user asks about devices, sensors, datastreams, measurements, or current values → call sensorthings_search\n"
-        "- If user asks about agronomy, treatments, recommendations, or farming knowledge → call search_knowledge_base\n"
-        "- You MUST call at least one appropriate tool based on the query\n"
-        "- Output ONLY tool calls - do NOT generate conversational responses or explanations\n"
-        "- Do NOT produce the final answer - that's the responder's job\n"
+        "Bạn là agent phân tích câu hỏi của nông dân và quyết định công cụ nào cần dùng.\n\n"
+        "LUẬT QUAN TRỌNG:\n"
+        "1. Nếu câu hỏi về KIỂM TRA/THEO DÕI dữ liệu thực tế (nhiệt độ, độ ẩm, NPK, pH, cảm biến):\n"
+        "   → GỌI sensorthings_search TRƯỚC\n"
+        "   → SAU ĐÓ GỌI search_knowledge_base để lấy ngưỡng chuẩn và khuyến nghị\n"
+        "\n"
+        "2. Nếu câu hỏi về KIẾN THỨC/HƯỚNG DẪN chung (kỹ thuật, phương pháp, bệnh hại):\n"
+        "   → CHỈ GỌI search_knowledge_base\n"
+        "\n"
+        "3. LUÔN GỌI ÍT NHẤT 1 CÔNG CỤ. Không trả lời trực tiếp.\n"
+        "\n"
+        "Ví dụ:\n"
+        "- 'Kiểm tra đất' → sensorthings_search + search_knowledge_base\n"
+        "- 'Hướng dẫn bón phân' → search_knowledge_base\n"
+        "- 'Nhiệt độ hiện tại' → sensorthings_search + search_knowledge_base\n"
     ))
 
-    # Send planner message to llm_with_tools so it can emit tool_calls
     messages = [system] + state["messages"]
-    result = await llm_with_tools.ainvoke(messages)
-    
-    # append (preserve history)
-    return {"messages": state["messages"] + [result]}
+    result = await workflow.llm_with_tools.ainvoke(messages)
+    return {"messages": [result]}
 
-
-async def tools_router(state: State):
-    """Route based on whether planner produced tool calls."""
+def tools_router(state: State) -> Literal["tool_node", "responder"]:
+    """Route to tools or responder based on last message"""
     last_message = state["messages"][-1]
-    
-    # Check if this is an AI message with tool calls
     if hasattr(last_message, "tool_calls") and len(last_message.tool_calls) > 0:
         return "tool_node"
-    else:
-        # If planner didn't call tools, go straight to responder
-        return "responder"
+    return "responder"
 
-
-async def tool_node(state: State):
-    """Execute tools and return results as ToolMessages."""
+async def tool_node(state: State, workflow: Workflow):
+    """Execute tool calls and store structured data"""
     tool_calls = getattr(state["messages"][-1], "tool_calls", [])
     tool_messages = []
-    
+    sensor_data = state.get("sensor_data", {})
+    kb_context = state.get("kb_context", "")
+
     for call in tool_calls:
         name = call["name"]
         args = call["args"]
@@ -90,89 +100,130 @@ async def tool_node(state: State):
         try:
             if name == "search_knowledge_base":
                 q = args.get("query") if isinstance(args, dict) else args
-                out = await search_knowledge_base.ainvoke(q)
-                # ensure JSON
+                out = await workflow.search_knowledge_base.ainvoke(q)
+                
                 try:
                     parsed = json.loads(out)
-                    # create a textual summary for the LLM
                     if parsed.get("type") == "docs":
-                        text = f"[KB Results for: {parsed.get('query')}]\n"
-                        for r in parsed.get("results", []):
-                            text += f"- {r.get('title')} | {r.get('source')} | {r.get('excerpt')}\n"
+                        text = f"[Kiến thức từ KB về: {parsed.get('query')}]\n"
+                        for r in parsed.get("results", [])[:5]:
+                            text += f"• {r.get('excerpt')}\n"
+                        kb_context += text + "\n"
                     else:
-                        text = parsed.get("text") if parsed.get("text") else str(parsed)
+                        text = parsed.get("text", str(parsed))
+                        kb_context += text + "\n"
                 except Exception:
                     text = out
+                    kb_context += text + "\n"
+                    
                 tool_messages.append(ToolMessage(content=text, tool_call_id=tool_id))
                 
             elif name == "sensorthings_search":
                 q = args.get("query") if isinstance(args, dict) else args
                 out = await sensorthings_search.ainvoke(q)
-                # out is dict
+                
                 if isinstance(out, dict):
-                    # pretty but succinct
+                    # Store structured sensor data for analysis
+                    sensor_data.update(out)
+                    
                     pretty = json.dumps(out, ensure_ascii=False, indent=2)
-                    # limit size
-                    if len(pretty) > 6000:
-                        pretty = pretty[:6000] + "... [truncated]"
+                    if len(pretty) > 4000:
+                        pretty = pretty[:4000] + "... [truncated]"
                     tool_messages.append(ToolMessage(content=pretty, tool_call_id=tool_id))
                 else:
                     tool_messages.append(ToolMessage(content=str(out), tool_call_id=tool_id))
-                    
             else:
                 tool_messages.append(ToolMessage(content=f"Unknown tool: {name}", tool_call_id=tool_id))
                 
         except Exception as e:
             tool_messages.append(ToolMessage(content=f"Tool {name} error: {str(e)}", tool_call_id=tool_id))
-            
-    # Return appended messages (so history preserved)
-    return {"messages": state["messages"] + tool_messages}
 
+    return {
+        "messages": tool_messages,
+        "sensor_data": sensor_data,
+        "kb_context": kb_context
+    }
 
-async def responder(state: State):
-    """Responder: use the latest context (including tool messages) to produce final answer to user.
-    This is the ONLY node that should generate the final user-facing response.
-    Append the response and preserve history.
-    """
-    # System prompt to instruct the model to use the documents/tools
-    system = SystemMessage(content=(
-        "Bạn là trợ lý nông nghiệp chuyên nghiệp của Việt Nam. "
-        "Dựa trên thông tin từ các công cụ (tool outputs) và knowledge base, "
-        "hãy trả lời câu hỏi của nông dân một cách ngắn gọn, rõ ràng và hữu ích.\n\n"
-        "Quy tắc quan trọng:\n"
-        "- Trả lời bằng TIẾNG VIỆT\n"
-        "- Nếu có giá trị cảm biến bất thường (được đánh dấu _validator), hãy cảnh báo và đề xuất kiểm tra lại\n"
-        "- Đưa ra số liệu cụ thể khi có thể\n"
-        "- Đưa ra các bước hành động thiết thực, dễ thực hiện\n"
-        "- Nếu thông tin không đủ, hãy nói rõ và hỏi thêm thông tin cần thiết\n"
-        "- QUAN TRỌNG: Chỉ trả lời MỘT LẦN duy nhất, không lặp lại nội dung\n"
-    ))
+async def responder(state: State, workflow: Workflow):
+    """Generate intelligent analysis and recommendations"""
     
+    # Check if we have sensor data
+    has_sensor_data = bool(state.get("sensor_data"))
+    
+    if has_sensor_data:
+        system = SystemMessage(content=(
+            "Bạn là chuyên gia nông nghiệp AI với khả năng PHÂN TÍCH CHUYÊN SÂU.\n\n"
+            "NHIỆM VỤ CỦA BẠN:\n"
+            "1. PHÂN TÍCH DỮ LIỆU:\n"
+            "   - So sánh từng chỉ số với ngưỡng chuẩn từ knowledge base\n"
+            "   - Xác định chỉ số NÀO TỐT, NÀO CẦN CẢI THIỆN, NÀO NGUY HIỂM\n"
+            "   - Giải thích TẠI SAO (ví dụ: N thấp → thiếu đạm → cây vàng lá)\n"
+            "\n"
+            "2. CẢNH BÁO RÕ RÀNG:\n"
+            "   - ⚠️ CẢNH BÁO: nếu có chỉ số nguy hiểm\n"
+            "   - ⚡ KHẨN CẤP: nếu cần xử lý ngay\n"
+            "   - ✅ BÌN THƯỜNG: nếu mọi thứ ổn\n"
+            "\n"
+            "3. KHUYẾN NGHỊ CỤ THỂ:\n"
+            "   - Tên phân bón/thuốc cần dùng (VD: Urê, NPK 16-16-8, DAP)\n"
+            "   - Liều lượng chính xác (VD: 50kg Urê/ha)\n"
+            "   - Thời điểm bón (VD: 7-10 ngày sau cấy)\n"
+            "   - Cách bón (VD: rải đều, hòa nước)\n"
+            "\n"
+            "4. KẾ HOẠCH THEO DÕI:\n"
+            "   - Kiểm tra lại sau bao lâu?\n"
+            "   - Cần quan sát triệu chứng gì?\n"
+            "\n"
+            "5. ĐỊNH DẠNG:\n"
+            "   - Dùng emoji để dễ nhìn (⚠️✅📊💡🌾)\n"
+            "   - Ngắn gọn, súc tích, dễ hiểu\n"
+            "   - Ưu tiên hành động TỨC THỜI\n"
+            "\n"
+            "LƯU Ý:\n"
+            "- KHÔNG chỉ liệt kê số liệu\n"
+            "- KHÔNG nói chung chung 'cần theo dõi'\n"
+            "- PHẢI đưa ra HÀNH ĐỘNG CỤ THỂ\n"
+            "- Trả lời bằng TIẾNG VIỆT\n"
+        ))
+    else:
+        system = SystemMessage(content=(
+            "Bạn là chuyên gia nông nghiệp Việt Nam.\n"
+            "Dựa trên kiến thức từ knowledge base, hãy:\n"
+            "1. Trả lời NGẮN GỌN, THỰC TẾ\n"
+            "2. Đưa ra SỐ LIỆU CỤ THỂ (liều lượng, thời gian)\n"
+            "3. Chia thành CÁC BƯỚC RÕ RÀNG\n"
+            "4. Dùng TIẾNG VIỆT dễ hiểu\n"
+            "5. Thêm emoji để dễ đọc nếu phù hợp\n"
+        ))
+
     messages = [system] + state["messages"]
-    
-    # Use llm (without tool-binding) to produce final answer
-    result = await llm.ainvoke(messages)
-    
-    return {"messages": state["messages"] + [result]}
+    result = await workflow.llm.ainvoke(messages)
+    return {"messages": [result]}
 
 # --------------------------
-# Graph assembly
+# Build graph
 # --------------------------
-graph_builder = StateGraph(State)
-graph_builder.add_node("planner", planner)
-graph_builder.add_node("tool_node", tool_node)
-graph_builder.add_node("responder", responder)
-
-# Set entry point
-graph_builder.set_entry_point("planner")
-
-# Conditional routing from planner
-graph_builder.add_conditional_edges("planner", tools_router)
-
-# Tool node always goes to responder
-graph_builder.add_edge("tool_node", "responder")
-
-# Responder goes to END (no loop back)
-graph_builder.add_edge("responder", END)
-
-graph = graph_builder.compile(checkpointer=memory)
+def build_graph(workflow: Workflow):
+    graph_builder = StateGraph(State)
+    
+    # Add nodes
+    graph_builder.add_node("planner", partial(planner, workflow=workflow))
+    graph_builder.add_node("tool_node", partial(tool_node, workflow=workflow))
+    graph_builder.add_node("responder", partial(responder, workflow=workflow))
+    
+    # Set entry point
+    graph_builder.set_entry_point("planner")
+    
+    # Add edges
+    graph_builder.add_conditional_edges(
+        "planner",
+        tools_router,
+        {
+            "tool_node": "tool_node",
+            "responder": "responder"
+        }
+    )
+    graph_builder.add_edge("tool_node", "responder")
+    graph_builder.add_edge("responder", END)
+    
+    return graph_builder.compile(checkpointer=memory)   

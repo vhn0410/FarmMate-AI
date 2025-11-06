@@ -1,0 +1,40 @@
+services:
+  rag-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-agent-app
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount local directories to persist data
+      - ./db_agriculture3:/app/db_agriculture3
+      - ./chunks.duckdb:/app/chunks.duckdb
+      - ./.env:/app/.env:ro
+      # Optional: mount source code for development (remove in production)
+      # - ./src:/app/src
+      # - ./main.py:/app/main.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PERSIST_DIR=db_agriculture3/chroma_db
+      - CHUNKS_DB=chunks.duckdb
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  # Optional: define named volumes if you prefer
+  chroma-data:
+  duckdb-data:

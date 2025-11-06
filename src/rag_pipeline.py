@@ -34,8 +34,6 @@ class RAGPipeline:
         return hasher.hexdigest()
 
 
-        
-
     def run_complete_ingestion_pipeline(self, pdf_dir: str, meta_path = METADATA_PATH):
         """Chỉ xử lý file PDF mới hoặc thay đổi."""
         print("🚀 Starting Incremental RAG Ingestion Pipeline")

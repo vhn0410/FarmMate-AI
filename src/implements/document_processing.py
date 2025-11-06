@@ -9,8 +9,6 @@ from unstructured.chunking.title import chunk_by_title
 
 # LangChain components
 from langchain_core.documents import Document
-# from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-# from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage

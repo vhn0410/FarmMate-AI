@@ -1,3 +1,9 @@
+This is an API for RAG & Agent framework with an OOP code structure easy to modify agent architecture
+Using Untructured to extract different type of files (pdf, docs, exel,...)  
+
+# python main.py -> run RAG pipeline with system documents 
+# uvicorn app:app --reload -> To start development API
+
 # System Dependencies
 
 To get started with Unstructured.io, we need a few system-wide dependencies: 
