@@ -7,7 +7,6 @@ from src.interfaces.base_documents import BaseDocument
 from src.interfaces.base_embedding import BaseEmbedding
 from src.interfaces.base_retriever import BaseRetriever
 from langchain_core.documents import Document
-from src.utils.export_chunks import export_chunks_to_json
 from src.implements.chunk_store_duck_db import DuckDBChunkStore
 
 @dataclass
@@ -79,7 +78,6 @@ class RAGPipeline:
             all_summarised_chunks.extend(summarised_chunks)
 
         
-        export_chunks_to_json(all_summarised_chunks)
         # ✅ Save to DuckDB
         self.chunk_store.save_chunks(all_summarised_chunks)
         

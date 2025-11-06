@@ -34,11 +34,3 @@ class BaseDocument(ABC):
         pass
     def summarise_chunks(chunks) -> DataItem:
         pass
-
-    # @abstractmethod
-    # def export_chunks_to_json(self, chunks, filename: str = "chunks_export.json") -> None:
-    #     pass
-   
-    # @abstractmethod
-    # def export_chunk_json_to_document_langchain(self, filepath="chunks_export.json") -> DataItem:
-    #     pass
