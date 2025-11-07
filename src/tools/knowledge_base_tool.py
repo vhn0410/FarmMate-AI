@@ -13,7 +13,7 @@ class KnowledgeBaseService:
         """
         try:
             retrieved_docs = self.retriever.hybrid_search(query)
-            reranker = CohereRerank(model="rerank-multilingual-v3.0", top_n=5)
+            reranker = CohereRerank(model="rerank-multilingual-v3.0", top_n=10)
             reranked = reranker.compress_documents(retrieved_docs, query)
             if not reranked:
                 return json.dumps({"type": "text_only", "text": "Không tìm thấy thông tin phù hợp."}, ensure_ascii=False)

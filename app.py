@@ -30,7 +30,8 @@ embedding = DocumentEmbedding()
 
 if os.path.exists(PERSIST_DIR):
     vector_db = embedding.load_vector_store(PERSIST_DIR)
-    vector_retriever = vector_db.as_retriever(search_kwargs={"k": 15})
+    # vector_retriever = vector_db.as_retriever(search_kwargs={"k": 15})
+    vector_retriever = vector_db.as_retriever(search_kwargs={"k": 50})
 else:
     vector_db = None
     vector_retriever = None
@@ -38,7 +39,8 @@ else:
 chunk_store = DuckDBChunkStore(CHUNKS_DB)
 documents: List[Document] = chunk_store.get_all_documents()
 bm25_retriever = BM25Retriever.from_documents(documents)
-bm25_retriever.k = 15
+# bm25_retriever.k = 15
+bm25_retriever.k = 50
 
 retriever = Retriever(vector_retriever=vector_retriever, bm25_retriever=bm25_retriever)
 

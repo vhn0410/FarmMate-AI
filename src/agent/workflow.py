@@ -28,6 +28,7 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
     sensor_data: dict  # Store parsed sensor data
     kb_context: str    # Store KB context
+    query_type: str    # Track query type: 'sensor_check' or 'knowledge'
 
 # --------------------------
 # Workflow class
@@ -57,21 +58,30 @@ llm_router = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 async def planner(state: State, workflow: Workflow):
     """Planner decides which tools to call based on query type."""
     system = SystemMessage(content=(
-        "Bạn là agent phân tích câu hỏi của nông dân và quyết định công cụ nào cần dùng.\n\n"
-        "LUẬT QUAN TRỌNG:\n"
-        "1. Nếu câu hỏi về KIỂM TRA/THEO DÕI dữ liệu thực tế (nhiệt độ, độ ẩm, NPK, pH, cảm biến):\n"
-        "   → GỌI sensorthings_search TRƯỚC\n"
-        "   → SAU ĐÓ GỌI search_knowledge_base để lấy ngưỡng chuẩn và khuyến nghị\n"
-        "\n"
-        "2. Nếu câu hỏi về KIẾN THỨC/HƯỚNG DẪN chung (kỹ thuật, phương pháp, bệnh hại):\n"
-        "   → CHỈ GỌI search_knowledge_base\n"
-        "\n"
-        "3. LUÔN GỌI ÍT NHẤT 1 CÔNG CỤ. Không trả lời trực tiếp.\n"
-        "\n"
+        "Bạn là agent phân loại câu hỏi của nông dân.\n\n"
+        "PHÂN LOẠI CÂU HỎI:\n\n"
+        "🔍 NHÓM 1 - KIỂM TRA/THEO DÕI DỮ LIỆU THỰC TẾ (sensor_check):\n"
+        "Các từ khóa: kiểm tra, theo dõi, hiện tại, bây giờ, đang, giờ này\n"
         "Ví dụ:\n"
-        "- 'Kiểm tra đất' → sensorthings_search + search_knowledge_base\n"
-        "- 'Hướng dẫn bón phân' → search_knowledge_base\n"
-        "- 'Nhiệt độ hiện tại' → sensorthings_search + search_knowledge_base\n"
+        "✓ 'Kiểm tra đất của tôi'\n"
+        "✓ 'Nhiệt độ hiện tại như thế nào?'\n"
+        "✓ 'Độ ẩm bây giờ ra sao?'\n"
+        "✓ 'Xem dữ liệu cảm biến'\n"
+        "→ GỌI: sensorthings_search + search_knowledge_base\n\n"
+        
+        "📚 NHÓM 2 - KIẾN THỨC/HƯỚNG DẪN (knowledge):\n"
+        "Các từ khóa: là gì, cách, kỹ thuật, hướng dẫn, phương pháp, giai đoạn, bệnh, sâu\n"
+        "Ví dụ:\n"
+        "✓ 'Cuối giai đoạn sinh trưởng là gì?'\n"
+        "✓ 'Hướng dẫn bón phân'\n"
+        "✓ 'Cách trị bệnh đạo ôn'\n"
+        "✓ 'Kỹ thuật làm đất'\n"
+        "→ GỌI: search_knowledge_base (CHỈ MỘT TOOL)\n\n"
+        
+        "QUAN TRỌNG:\n"
+        "- Nếu câu hỏi KHÔNG có từ 'kiểm tra/theo dõi/hiện tại/bây giờ' → CHỈ gọi search_knowledge_base\n"
+        "- Nếu câu hỏi về ĐỊNH NGHĨA, GIẢI THÍCH, HƯỚNG DẪN → CHỈ gọi search_knowledge_base\n"
+        "- LUÔN gọi ít nhất 1 tool\n"
     ))
 
     messages = [system] + state["messages"]
@@ -89,8 +99,15 @@ async def tool_node(state: State, workflow: Workflow):
     """Execute tool calls and store structured data"""
     tool_calls = getattr(state["messages"][-1], "tool_calls", [])
     tool_messages = []
-    sensor_data = state.get("sensor_data", {})
+    
+    # RESET sensor_data when starting new tool execution
+    sensor_data = {}
     kb_context = state.get("kb_context", "")
+    query_type = "knowledge"  # Default
+    
+    has_sensor_call = any(call["name"] == "sensorthings_search" for call in tool_calls)
+    if has_sensor_call:
+        query_type = "sensor_check"
 
     for call in tool_calls:
         name = call["name"]
@@ -141,16 +158,19 @@ async def tool_node(state: State, workflow: Workflow):
     return {
         "messages": tool_messages,
         "sensor_data": sensor_data,
-        "kb_context": kb_context
+        "kb_context": kb_context,
+        "query_type": query_type
     }
 
 async def responder(state: State, workflow: Workflow):
     """Generate intelligent analysis and recommendations"""
     
-    # Check if we have sensor data
+    # Check query type and sensor data
+    query_type = state.get("query_type", "knowledge")
     has_sensor_data = bool(state.get("sensor_data"))
     
-    if has_sensor_data:
+    # Only use sensor analysis system prompt if BOTH conditions are true
+    if query_type == "sensor_check" and has_sensor_data:
         system = SystemMessage(content=(
             "Bạn là chuyên gia nông nghiệp AI với khả năng PHÂN TÍCH CHUYÊN SÂU.\n\n"
             "NHIỆM VỤ CỦA BẠN:\n"
@@ -162,7 +182,7 @@ async def responder(state: State, workflow: Workflow):
             "2. CẢNH BÁO RÕ RÀNG:\n"
             "   - ⚠️ CẢNH BÁO: nếu có chỉ số nguy hiểm\n"
             "   - ⚡ KHẨN CẤP: nếu cần xử lý ngay\n"
-            "   - ✅ BÌN THƯỜNG: nếu mọi thứ ổn\n"
+            "   - ✅ BÌNH THƯỜNG: nếu mọi thứ ổn\n"
             "\n"
             "3. KHUYẾN NGHỊ CỤ THỂ:\n"
             "   - Tên phân bón/thuốc cần dùng (VD: Urê, NPK 16-16-8, DAP)\n"
@@ -186,14 +206,24 @@ async def responder(state: State, workflow: Workflow):
             "- Trả lời bằng TIẾNG VIỆT\n"
         ))
     else:
+        # Knowledge-only system prompt
         system = SystemMessage(content=(
-            "Bạn là chuyên gia nông nghiệp Việt Nam.\n"
-            "Dựa trên kiến thức từ knowledge base, hãy:\n"
-            "1. Trả lời NGẮN GỌN, THỰC TẾ\n"
-            "2. Đưa ra SỐ LIỆU CỤ THỂ (liều lượng, thời gian)\n"
-            "3. Chia thành CÁC BƯỚC RÕ RÀNG\n"
-            "4. Dùng TIẾNG VIỆT dễ hiểu\n"
-            "5. Thêm emoji để dễ đọc nếu phù hợp\n"
+            "Bạn là chuyên gia nông nghiệp Việt Nam.\n\n"
+            "NHIỆM VỤ:\n"
+            "- Trả lời dựa HOÀN TOÀN trên kiến thức từ knowledge base\n"
+            "- KHÔNG đề cập đến dữ liệu cảm biến nếu câu hỏi không yêu cầu\n"
+            "- Giải thích RÕ RÀNG, DỄ HIỂU các khái niệm\n"
+            "- Đưa ra SỐ LIỆU CỤ THỂ nếu có (liều lượng, thời gian)\n"
+            "- Chia thành CÁC BƯỚC nếu là hướng dẫn\n"
+            "\n"
+            "ĐỊNH DẠNG:\n"
+            "- Dùng emoji phù hợp để dễ đọc\n"
+            "- Ngắn gọn, tập trung vào câu hỏi\n"
+            "- TIẾNG VIỆT dễ hiểu\n"
+            "\n"
+            "LƯU Ý:\n"
+            "- Nếu KB không có thông tin → nói rõ 'Tôi không tìm thấy thông tin này trong tài liệu'\n"
+            "- KHÔNG bịa đặt thông tin không có trong KB\n"
         ))
 
     messages = [system] + state["messages"]
@@ -226,4 +256,4 @@ def build_graph(workflow: Workflow):
     graph_builder.add_edge("tool_node", "responder")
     graph_builder.add_edge("responder", END)
     
-    return graph_builder.compile(checkpointer=memory)   
+    return graph_builder.compile(checkpointer=memory)
