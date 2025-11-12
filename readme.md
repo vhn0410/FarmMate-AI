@@ -1,1 +1,1 @@
-<img width="10968" height="3788" alt="image" src="https://github.com/user-attachments/assets/da2968a6-a5a4-4e71-98fd-b802f3ac62b2" />
+<img width="1152" height="392" alt="supervisor_architecture" src="https://github.com/user-attachments/assets/bf654cd9-344c-4578-bb20-bee6d8b0a858" />
