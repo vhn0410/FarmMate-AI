@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 import json
 from functools import partial
+import asyncio
 
 load_dotenv()
 
@@ -49,7 +50,7 @@ class Workflow:
 # --------------------------
 # LLM setup
 # --------------------------
-llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
 llm_router = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 # --------------------------
@@ -227,8 +228,21 @@ async def responder(state: State, workflow: Workflow):
         ))
 
     messages = [system] + state["messages"]
-    result = await workflow.llm.ainvoke(messages)
-    return {"messages": [result]}
+    print("Responder messages:", messages)
+    try:
+        
+        # 1. Gọi LLM an toàn
+        result = await workflow.llm.ainvoke(messages, stream=False)
+
+        #  2. Extract content thay vì trả nguyên object
+        text = result.content if hasattr(result, "content") else str(result)
+
+        #  3. Trả về JSON serializable object
+        return {"messages": [AIMessage(content=text)]}
+    except asyncio.CancelledError:
+        # Khi bị hủy bởi LangGraph/LangSmith, ta không cần xem là lỗi
+        print("Responder task was cancelled (likely by LangGraph).")
+        return None
 
 # --------------------------
 # Build graph

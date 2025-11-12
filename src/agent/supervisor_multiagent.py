@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 import json
 from functools import partial
-
+import asyncio
 load_dotenv()
 
 # --------------------------
@@ -72,11 +72,15 @@ async def supervisor(state: State, workflow: Workflow):
     """
     iteration = state.get("iteration_count", 0)
     
+    # Nếu người dùng chỉ chat xã giao, kết thúc luôn
     # Luồng chính: Enhancement → Tool Execution → Response → QA
     if iteration == 0:
         return {"next_agent": "query_enhancement", "iteration_count": 1}
     
     last_agent = state.get("next_agent", "")
+    
+    if last_agent == "query_enhancement" and state.get("tool_plan", {}).get("intent") == "small_talk":
+        return {"next_agent": "end"}
     
     if last_agent == "query_enhancement":
         return {"next_agent": "tool_execution"}
@@ -150,24 +154,33 @@ async def query_enhancement_agent(state: State, workflow: Workflow):
     messages = [system, HumanMessage(content=original_query)]
     result = await workflow.llm_router.ainvoke(messages)
     
-    # Parse enhanced query
-    try:
-        content = result.content.strip()
-        # Remove markdown code blocks if present
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        enhanced = json.loads(content.strip())
-    except Exception as e:
-        print(f"[Query Enhancement] Parse error: {e}, using default")
+    # Nhận diện câu đơn giản, chào hỏi, không liên quan nông nghiệp
+    if any(greet in original_query.lower() for greet in ["xin chào", "hello", "hi", "chào bạn"]):
         enhanced = {
-            "intent": "ask_knowledge",
+            "intent": "small_talk",
             "enhanced_query": original_query,
-            "data_needs": ["knowledge_base"],
-            "context": ""
+            "data_needs": [],  # Không cần gọi tool
+            "context": "Người dùng chỉ chào hỏi, không yêu cầu thông tin nông nghiệp"
         }
-    
+    else:
+        # Parse enhanced query
+        try:
+            content = result.content.strip()
+            # Remove markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            enhanced = json.loads(content.strip())
+        except Exception as e:
+            print(f"[Query Enhancement] Parse error: {e}, using default")
+            enhanced = {
+                "intent": "ask_knowledge",
+                "enhanced_query": original_query,
+                "data_needs": ["knowledge_base"],
+                "context": ""
+            }
+        
     return {
         "original_query": original_query,
         "enhanced_query": enhanced.get("enhanced_query", original_query),
@@ -265,12 +278,15 @@ async def response_generation_agent(state: State, workflow: Workflow):
     Response Generation Agent (STREAMING ENABLED)
     - CHỈ trả lời dựa trên dữ liệu từ tools
     - Nếu không có dữ liệu → nói không biết
+    
+    FIX: Không truyền ToolMessage vào LLM, chỉ truyền data dạng text
     """
     has_sensor_data = state.get("has_sensor_data", False)
     has_kb_data = state.get("has_kb_data", False)
     sensor_data = state.get("sensor_data", {})
     kb_context = state.get("kb_context", "")
     qa_feedback = state.get("qa_feedback", {})
+    original_query = state.get("original_query", "")
     
     # KIỂM TRA có dữ liệu không
     if not has_kb_data and not has_sensor_data:
@@ -309,6 +325,8 @@ async def response_generation_agent(state: State, workflow: Workflow):
             "   - Ngắn gọn, dễ hiểu\n"
             "   - Hành động cụ thể\n"
         )
+        data_context = f"\n\n--- SENSOR DATA ---\n{json.dumps(sensor_data, ensure_ascii=False, indent=2)}\n\n--- KNOWLEDGE BASE ---\n{kb_context}"
+    
     elif has_kb_data:
         system_prompt = (
             "Bạn là chuyên gia nông nghiệp. CHỈ trả lời dựa trên Knowledge Base Context được cung cấp.\n\n"
@@ -322,7 +340,9 @@ async def response_generation_agent(state: State, workflow: Workflow):
             "3. Số liệu chính xác (nếu có)\n"
             "4. Ngắn gọn, dễ hiểu\n"
         )
-    else:
+        data_context = f"\n\n--- KNOWLEDGE BASE ---\n{kb_context}"
+    
+    else:  # has_sensor_data only
         system_prompt = (
             "Bạn là chuyên gia nông nghiệp. CHỈ trả lời dựa trên Sensor Data được cung cấp.\n\n"
             "LUẬT QUAN TRỌNG:\n"
@@ -330,27 +350,31 @@ async def response_generation_agent(state: State, workflow: Workflow):
             "- KHÔNG đưa ra khuyến nghị nếu không có KB context\n"
             "- Nói rõ 'cần thêm thông tin về ngưỡng chuẩn'\n"
         )
+        data_context = f"\n\n--- SENSOR DATA ---\n{json.dumps(sensor_data, ensure_ascii=False, indent=2)}"
     
     # Nếu có feedback từ QA
     if qa_feedback.get("needs_improvement"):
         system_prompt += f"\n\nCẢI THIỆN DỰA TRÊN FEEDBACK:\n{qa_feedback.get('suggestions', '')}"
     
+    # QUAN TRỌNG: Chỉ dùng SystemMessage và HumanMessage
+    # KHÔNG dùng ToolMessage vì không có AIMessage với tool_calls đứng trước
     system = SystemMessage(content=system_prompt)
+    human = HumanMessage(content=f"Câu hỏi: {original_query}{data_context}")
     
-    # Lọc messages: chỉ giữ tool messages
-    tool_messages = [msg for msg in state["messages"] if isinstance(msg, ToolMessage)]
-    
-    messages = [system] + tool_messages + [
-        HumanMessage(content=f"Câu hỏi: {state.get('original_query', '')}")
-    ]
+    messages = [system, human]
     
     # STREAM response
-    result = await workflow.llm.ainvoke(messages)
-    
-    return {
-        "draft_response": result.content,
-        "messages": [result]
-    }
+    try:
+        result = await workflow.llm.ainvoke(messages)
+        
+        return {
+            "draft_response": result.content,
+            "messages": [result]
+        }
+    except asyncio.CancelledError:
+        # Khi bị hủy bởi LangGraph/LangSmith, ta không cần xem là lỗi
+        print("Responder task was cancelled (likely by LangGraph).")
+        return None
 
 
 async def quality_assurance_agent(state: State, workflow: Workflow):
@@ -403,16 +427,24 @@ CÂU TRẢ LỜI:
     messages = [system, HumanMessage(content=evaluation_prompt)]
     result = await workflow.llm_router.ainvoke(messages)
     
-    # Parse QA feedback
+    # Parse QA feedback (ROBUST PARSING)
     try:
         content = result.content.strip()
+        
+        # Remove markdown code blocks
         if content.startswith("```"):
-            content = content.split("```")[1]
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1])  # Remove first and last lines
             if content.startswith("json"):
-                content = content[4:]
+                content = content[4:].strip()
+        
+        # Replace single quotes with double quotes for JSON compatibility
+        content = content.replace("'", '"')
+        
         qa_feedback = json.loads(content.strip())
     except Exception as e:
-        print(f"[QA] Parse error: {e}, using default")
+        print(f"[QA] Parse error: {e}")
+        print(f"[QA] Raw content: {result.content[:200]}")
         qa_feedback = {
             "score": 85,
             "needs_improvement": False,

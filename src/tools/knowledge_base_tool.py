@@ -18,7 +18,7 @@ class KnowledgeBaseService:
             if not reranked:
                 return json.dumps({"type": "text_only", "text": "Không tìm thấy thông tin phù hợp."}, ensure_ascii=False)
             docs_out = []
-            for d in reranked[:8]:
+            for d in reranked[:10]:
                 text_excerpt = (d.page_content[:600] + "...") if len(d.page_content) > 600 else d.page_content
                 docs_out.append({"title": d.metadata.get("title", ""), "excerpt": text_excerpt, "source": d.metadata.get("source", ""), "id": d.metadata.get("id", "")})
             return json.dumps({"type": "docs", "query": query, "results": docs_out}, ensure_ascii=False)

@@ -14,7 +14,7 @@ from src.implements.chunk_store_duck_db import DuckDBChunkStore
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from src.utils.utils import safe_json_escape, serialise_ai_message_chunk
-from src.agent.workflow import Workflow, build_graph
+from src.agent.supervisor_multiagent import Workflow, build_graph
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
@@ -30,7 +30,6 @@ embedding = DocumentEmbedding()
 
 if os.path.exists(PERSIST_DIR):
     vector_db = embedding.load_vector_store(PERSIST_DIR)
-    # vector_retriever = vector_db.as_retriever(search_kwargs={"k": 15})
     vector_retriever = vector_db.as_retriever(search_kwargs={"k": 50})
 else:
     vector_db = None
@@ -39,7 +38,6 @@ else:
 chunk_store = DuckDBChunkStore(CHUNKS_DB)
 documents: List[Document] = chunk_store.get_all_documents()
 bm25_retriever = BM25Retriever.from_documents(documents)
-# bm25_retriever.k = 15
 bm25_retriever.k = 50
 
 retriever = Retriever(vector_retriever=vector_retriever, bm25_retriever=bm25_retriever)
@@ -71,7 +69,7 @@ class ChatRequest(BaseModel):
     checkpoint_id: Optional[str] = None
 
 # --------------------------
-# SSE generator (Fixed)
+# SSE generator (FIXED)
 # --------------------------
 async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = None):
     try:
@@ -84,44 +82,58 @@ async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = N
         else:
             config = {"configurable": {"thread_id": checkpoint_id}}
 
-        # Stream events với timeout protection
+        # Create streaming event generator
         try:
             events = graph.astream_events(
-                {"messages": [HumanMessage(content=message)]}, 
-                version="v2", 
+                {"messages": [HumanMessage(content=message)]},
+                version="v2",
                 config=config
             )
-            
+
             response_started = False
-            
+            response_ended = False
+
             async for event in events:
-                et = event["event"]
-                node_name = event.get("metadata", {}).get("langgraph_node", "")
-                
-                # Stream only responder content
-                if et == "on_chat_model_stream" and node_name == "responder":
-                    response_started = True
-                    chunk_data = event.get("data", {})
-                    chunk = chunk_data.get("chunk")
+                if response_ended:
+                    break
                     
+                et = event.get("event")
+                node_name = event.get("metadata", {}).get("langgraph_node", "")
+                event_data = event.get("data", {})
+
+                # --- 1️⃣ Stream chat model output từ response_generation ---
+                if et == "on_chat_model_stream" and node_name == "response_generation":
+                    response_started = True
+                    chunk = event_data.get("chunk")
                     if chunk:
                         chunk_content = serialise_ai_message_chunk(chunk)
                         if chunk_content:
                             safe = safe_json_escape(chunk_content)
                             yield f"data: {{\"type\": \"content\", \"content\": \"{safe}\"}}\n\n"
-                            
-                elif et == "on_chat_model_end" and node_name == "responder":
+
+                # --- 2️⃣ Detect tool calls (search_start) ---
+                elif et == "on_chat_model_end" and node_name == "response_generation":
+                    output = event_data.get("output")
+                    
+                    # Nếu AI đã stream response
                     if response_started:
                         yield f"data: {{\"type\": \"end\"}}\n\n"
-                    break
-                    
+                        response_ended = True
+
+                # --- 3️⃣ Tool result (search_results) - CHỈ LOG, KHÔNG GỬI ---
+                elif et == "on_tool_end":
+                    tool_name = event.get("name")
+                    print(f"[APP] Tool {tool_name} completed")
+                    # KHÔNG yield search_results nữa vì không cần thiết
+
         except asyncio.CancelledError:
             yield f"data: {{\"type\": \"error\", \"message\": \"Request cancelled\"}}\n\n"
             return
-            
+
     except Exception as e:
         error_msg = safe_json_escape(str(e))
         yield f"data: {{\"type\": \"error\", \"message\": \"{error_msg}\"}}\n\n"
+
 
 @app.get("/chat_stream")
 async def chat_stream_get(message: str, checkpoint_id: Optional[str] = Query(None)):

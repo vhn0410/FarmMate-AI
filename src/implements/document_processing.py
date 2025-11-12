@@ -96,18 +96,18 @@ class DocumentProcessing(BaseDocument):
 
             # --- Build main prompt ---
             prompt_text = f"""
-    Bạn là hệ thống tạo mô tả phục vụ cho việc truy xuất trong RAG.
+Bạn là hệ thống tạo mô tả phục vụ cho việc truy xuất trong RAG.
 
-    QUY TẮC TUYỆT ĐỐI:
-    - Không được bắt đầu câu trả lời bằng các cụm như: "Chắc chắn rồi", "Dưới đây là", "Tôi sẽ", "Vâng", "Được thôi".
-    - Không được viết lời mở đầu, lời chào, lời giải thích về quy trình.
-    - Không được viết câu meta như "Theo yêu cầu của bạn".
-    - Chỉ xuất *nội dung mô tả thuần túy*.
+QUY TẮC TUYỆT ĐỐI:
+- Không được bắt đầu câu trả lời bằng các cụm như: "Chắc chắn rồi", "Dưới đây là", "Tôi sẽ", "Vâng", "Được thôi".
+- Không được viết lời mở đầu, lời chào, lời giải thích về quy trình.
+- Không được viết câu meta như "Theo yêu cầu của bạn".
+- Chỉ xuất *nội dung mô tả thuần túy*.
 
-    NỘI DUNG CẦN PHÂN TÍCH
+NỘI DUNG CẦN PHÂN TÍCH
 
-    VĂN BẢN:
-    {text}
+VĂN BẢN:
+{text}
 
     """
 
@@ -119,19 +119,19 @@ class DocumentProcessing(BaseDocument):
 
             # ✅ Add instructions
             prompt_text += """
-    NHIỆM VỤ:
-    Hãy tạo một mô tả có thể tìm kiếm, bao gồm:
+NHIỆM VỤ:
+Hãy tạo một mô tả có thể tìm kiếm, bao gồm:
 
-    1. Các dữ kiện quan trọng, số liệu, con số  
-    2. Các chủ đề và khái niệm chính  
-    3. Những câu hỏi mà nội dung có thể trả lời  
-    4. Phân tích các hình ảnh (nếu có)  
-    5. Các từ khóa tìm kiếm và từ khóa thay thế  
+1. Các dữ kiện quan trọng, số liệu, con số  
+2. Các chủ đề và khái niệm chính  
+3. Những câu hỏi mà nội dung có thể trả lời  
+4. Phân tích các hình ảnh (nếu có)  
+5. Các từ khóa tìm kiếm và từ khóa thay thế  
 
-    Lưu ý: Chỉ xuất nội dung mô tả. Không được viết lời dẫn.
+Lưu ý: Chỉ xuất nội dung mô tả. Không được viết lời dẫn.
 
-    BẮT ĐẦU MÔ TẢ:
-    """
+BẮT ĐẦU MÔ TẢ:
+"""
 
             # --- Build message payload ---
             message_content = [
