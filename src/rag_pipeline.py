@@ -36,7 +36,7 @@ class RAGPipeline:
 
     def run_complete_ingestion_pipeline(self, pdf_dir: str, meta_path = METADATA_PATH):
         """Chỉ xử lý file PDF mới hoặc thay đổi."""
-        print("🚀 Starting Incremental RAG Ingestion Pipeline")
+        print(" Starting Incremental RAG Ingestion Pipeline")
         print("=" * 50)
 
         # Load metadata cũ
@@ -53,13 +53,13 @@ class RAGPipeline:
             print("Get file hash")
             file_hash = self.get_file_hash(pdf_path)
             if pdf_path not in processed_meta or processed_meta[pdf_path] != file_hash:
-                print(f"📄 Mới hoặc thay đổi: {pdf_path}")
+                print(f" Mới hoặc thay đổi: {pdf_path}")
                 new_files.append((pdf_path, file_hash))
             else:
-                print(f"✅ Bỏ qua (đã có): {pdf_path}")
+                print(f" Bỏ qua (đã có): {pdf_path}")
 
         if not new_files:
-            print("✅ Không có file mới. Bỏ qua ingestion.")
+            print("Không có file mới. Bỏ qua ingestion.")
             return None
 
         all_summarised_chunks = []
@@ -76,10 +76,10 @@ class RAGPipeline:
             all_summarised_chunks.extend(summarised_chunks)
 
         
-        # ✅ Save to DuckDB
+        # Save to DuckDB
         self.chunk_store.save_chunks(all_summarised_chunks)
         
-        # ✅ Save embeddings
+        # Save embeddings
         # db = create_vector_store(all_summarised_chunks, persist_directory="db_agriculture2/chroma_db")
         db = self.embedding_execution.create_vector_store(all_summarised_chunks, persist_directory=self.EMBEDDING_VECTOR_DB_DIR)
 
@@ -87,5 +87,5 @@ class RAGPipeline:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(processed_meta, f, ensure_ascii=False, indent=2)
 
-        print("🎉 Incremental ingestion completed successfully!")
+        print("Incremental ingestion completed successfully!")
         return db

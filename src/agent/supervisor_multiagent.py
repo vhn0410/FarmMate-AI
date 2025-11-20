@@ -38,6 +38,15 @@ class State(TypedDict):
     needs_improvement: bool  # Flag để quyết định có cần cải thiện không
     has_kb_data: bool  # Flag kiểm tra có dữ liệu KB không
     has_sensor_data: bool  # Flag kiểm tra có dữ liệu sensor không
+    # ✅ NEW: Thêm flag để tracking conversation stage
+    conversation_stage: str  # "new_turn" | "processing" | "completed"
+
+SUPERVISOR = "supervisor"
+QUERY_ENHANCER = "query_enhancement"
+TOOL_EXECUTOR = "tool_execution"
+RESPONSE_GENERATOR = "response_generation"
+QUALITY_ASSURER = "quality_assurance"
+
 
 # --------------------------
 # Workflow class
@@ -62,127 +71,230 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
 llm_router = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 # --------------------------
+# Helper Functions
+# --------------------------
+
+def count_human_messages(messages: list) -> int:
+    """Đếm số HumanMessage trong danh sách messages"""
+    return sum(1 for m in messages if isinstance(m, HumanMessage))
+
+def count_ai_responses(messages: list) -> int:
+    """Đếm số AIMessage thực sự (không phải internal messages như [Enhanced Query:])"""
+    return sum(1 for m in messages if isinstance(m, AIMessage) and not m.content.startswith("["))
+
+def is_new_user_turn(messages: list) -> bool:
+    """
+    Phát hiện turn mới từ user bằng cách so sánh số HumanMessage vs AI responses
+    ✅ Best Practice từ LangGraph documentation
+    """
+    if not messages:
+        return True
+    
+    # Nếu message cuối không phải HumanMessage → không phải turn mới
+    if not isinstance(messages[-1], HumanMessage):
+        return False
+    
+    human_count = count_human_messages(messages)
+    ai_count = count_ai_responses(messages)
+    
+    # Nếu số HumanMessage > số AI responses → đây là turn mới
+    return human_count > ai_count
+
+# --------------------------
 # Agent Nodes
 # --------------------------
 
 async def supervisor(state: State, workflow: Workflow):
     """
-    Supervisor Agent - Điều phối workflow
-    Quyết định agent nào chạy tiếp theo
+    ✅ FIXED Supervisor Agent - Điều phối workflow với MEMORY PRESERVATION
+    
+    Best Practices:
+    1. Detect new user message → Reset WORKFLOW state (NOT messages!)
+    2. Keep messages for memory continuity
+    3. Track conversation_stage để tránh state pollution
     """
+    messages = state.get("messages", [])
+    
+    # ✅ CRITICAL FIX: Phát hiện turn mới từ user
+    if is_new_user_turn(messages):
+        latest_query = messages[-1].content
+        print(f"\n[Supervisor] 🆕 NEW TURN DETECTED: '{latest_query}'")
+        print(f"[Supervisor] 🧠 Resetting workflow state while KEEPING message history...")
+        
+        return {
+            "conversation_stage": "processing",
+            "next_agent": "query_enhancement",
+            "iteration_count": 1,
+            "original_query": latest_query,
+            # ✅ RESET workflow state (NOT messages - they're preserved by checkpointer)
+            "enhanced_query": "",
+            "tool_plan": {},
+            "sensor_data": {},
+            "kb_context": "",
+            "draft_response": "",
+            "qa_feedback": {},
+            "needs_improvement": False,
+            "has_kb_data": False,
+            "has_sensor_data": False
+            # ⚠️ KHÔNG reset "messages" - LangGraph checkpointer tự động giữ lại!
+        }
+    
+    # ✅ CONTINUE existing workflow
+    print(f"\n[Supervisor] 🔄 CONTINUING WORKFLOW")
+    
+    stage = state.get("conversation_stage", "processing")
     iteration = state.get("iteration_count", 0)
-    
-    # Nếu người dùng chỉ chat xã giao, kết thúc luôn
-    # Luồng chính: Enhancement → Tool Execution → Response → QA
-    if iteration == 0:
-        return {"next_agent": "query_enhancement", "iteration_count": 1}
-    
     last_agent = state.get("next_agent", "")
-    
-    if last_agent == "query_enhancement" and state.get("tool_plan", {}).get("intent") == "small_talk":
-        return {"next_agent": "end"}
-    
+    tool_plan = state.get("tool_plan", {})
+    intent = tool_plan.get("intent", "") if tool_plan else ""
+
+    # Small talk routing
+    if last_agent == "query_enhancement" and intent == "small_talk":
+        print(f"[Supervisor] Routing to small_talk_response")
+        return {"next_agent": "small_talk_response"}
+
+    # Normal workflow routing
     if last_agent == "query_enhancement":
+        print(f"[Supervisor] Routing to tool_execution")
         return {"next_agent": "tool_execution"}
-    
+
     elif last_agent == "tool_execution":
+        print(f"[Supervisor] Routing to response_generation")
         return {"next_agent": "response_generation"}
-    
+
     elif last_agent == "response_generation":
-        # Nếu chưa qua QA lần nào, bắt buộc phải qua QA
         if not state.get("qa_feedback"):
+            print(f"[Supervisor] Routing to quality_assurance")
             return {"next_agent": "quality_assurance"}
-        # Nếu đã qua QA và không cần cải thiện nữa
         else:
-            return {"next_agent": "end"}
-    
+            print(f"[Supervisor] Workflow complete, ending")
+            return {"next_agent": "end", "conversation_stage": "completed"}
+
     elif last_agent == "quality_assurance":
         needs_improvement = state.get("needs_improvement", False)
-        
-        # Nếu cần cải thiện và chưa quá 2 lần
         if needs_improvement and iteration < 3:
-            return {
-                "next_agent": "response_generation",
-                "iteration_count": iteration + 1
-            }
+            print(f"[Supervisor] QA requires improvement (iteration {iteration}), routing back to response_generation")
+            return {"next_agent": "response_generation", "iteration_count": iteration + 1}
         else:
-            return {"next_agent": "end"}
+            print(f"[Supervisor] QA passed or max iterations reached, ending")
+            return {"next_agent": "end", "conversation_stage": "completed"}
     
-    return {"next_agent": "end"}
+    elif last_agent == "small_talk_response":
+        print(f"[Supervisor] Small talk completed, ending")
+        return {"next_agent": "end", "conversation_stage": "completed"}
+
+    # Fallback
+    print(f"[Supervisor] ⚠️ Unexpected state, ending workflow")
+    return {"next_agent": "end", "conversation_stage": "completed"}
 
 
 async def query_enhancement_agent(state: State, workflow: Workflow):
     """
-    Query Enhancement Agent
-    - Phân tích ý định người dùng
-    - Mở rộng câu hỏi với context nông nghiệp
-    - Xác định loại thông tin cần thiết
+    Query Enhancement Agent - Phân tích ý định và mở rộng câu hỏi
     """
     system = SystemMessage(content=(
-        "Bạn là Query Enhancement Agent - chuyên gia phân tích câu hỏi nông nghiệp.\n\n"
-        "NHIỆM VỤ:\n"
-        "1. Phân tích ý định của nông dân:\n"
-        "   - 'check_sensor_data': Kiểm tra dữ liệu thực tế (nhiệt độ, độ ẩm, NPK, pH, cảm biến)\n"
-        "   - 'ask_knowledge': Hỏi kiến thức chung (kỹ thuật, phương pháp, bệnh hại)\n"
-        "   - 'consultation': Cần tư vấn (bón phân, xử lý bệnh)\n"
-        "2. Mở rộng câu hỏi với thuật ngữ chuyên môn\n"
-        "3. Xác định tools cần gọi\n\n"
-        "LUẬT QUAN TRỌNG:\n"
-        "- Nếu câu hỏi về KIỂM TRA/THEO DÕI dữ liệu → data_needs: ['sensor_data', 'knowledge_base']\n"
-        "- Nếu câu hỏi về KIẾN THỨC/HƯỚNG DẪN → data_needs: ['knowledge_base']\n"
-        "- LUÔN phải có ít nhất 1 tool trong data_needs\n\n"
-        "VÍ DỤ:\n"
-        "Input: 'Kiểm tra đất'\n"
-        "Output: {\n"
-        "  'intent': 'check_sensor_data',\n"
-        "  'enhanced_query': 'Kiểm tra các chỉ số đất: NPK, pH, độ ẩm, nhiệt độ đất',\n"
-        "  'data_needs': ['sensor_data', 'knowledge_base'],\n"
-        "  'context': 'Nông dân cần biết tình trạng đất để quyết định bón phân'\n"
-        "}\n\n"
-        "Input: 'Cách bón phân cho lúa'\n"
-        "Output: {\n"
-        "  'intent': 'ask_knowledge',\n"
-        "  'enhanced_query': 'Hướng dẫn bón phân cho lúa: loại phân, liều lượng, thời điểm',\n"
-        "  'data_needs': ['knowledge_base'],\n"
-        "  'context': 'Nông dân cần hướng dẫn kỹ thuật bón phân'\n"
-        "}\n\n"
-        "Trả về JSON format. Phân tích câu hỏi sau:"
+        "Bạn là chuyên gia phân tích ý định người dùng trong lĩnh vực nông nghiệp thông minh.\n\n"
+        
+        "# NHIỆM VỤ:\n"
+        "Phân tích câu hỏi và xác định:\n"
+        "1. Người dùng muốn gì? (intent)\n"
+        "2. Câu hỏi đã đủ rõ chưa? Cần mở rộng thêm gì?\n"
+        "3. Cần dữ liệu gì để trả lời? (sensor data, knowledge base, hay không cần gì)\n\n"
+        
+        "# PHÂN LOẠI INTENT:\n\n"
+        
+        "## 🗣️ small_talk\n"
+        "Câu hỏi KHÔNG liên quan đến nông nghiệp:\n"
+        "- Chào hỏi xã giao: 'xin chào', 'hello', 'chào bạn'\n"
+        "- Giới thiệu bản thân: 'tôi là...', 'mình tên...', 'tên tôi'\n"
+        "- Câu hỏi về danh tính: 'bạn là ai', 'tên bạn', 'tôi là ai'\n"
+        "- Câu hỏi cá nhân: 'tôi đẹp không', 'hôm nay thứ mấy'\n"
+        "- Cảm ơn/tạm biệt: 'thanks', 'cảm ơn', 'bye'\n"
+        "→ data_needs: [] (KHÔNG cần gọi tool)\n\n"
+        
+        "## 📊 check_sensor_data\n"
+        "Người dùng muốn KIỂM TRA/XEM dữ liệu thực tế:\n"
+        "- Chỉ số cảm biến: 'nhiệt độ bao nhiêu', 'độ ẩm hiện tại', 'pH đất'\n"
+        "- Trạng thái thiết bị: 'cảm biến đất số 1', 'thiết bị hoạt động'\n"
+        "- So sánh xu hướng: 'nhiệt độ có tăng không', 'NPK thay đổi'\n"
+        "→ data_needs: ['sensor_data', 'knowledge_base']\n\n"
+        
+        "## 📚 ask_knowledge\n"
+        "Người dùng muốn HỌC/HIỂU kiến thức:\n"
+        "- Kiến thức chung: 'cách trồng lúa', 'chu kỳ sinh trưởng'\n"
+        "- Giải thích: 'tại sao lá vàng', 'nguyên nhân cây chết'\n"
+        "- Hướng dẫn: 'cách bón phân', 'phòng trừ sâu bệnh'\n"
+        "→ data_needs: ['knowledge_base']\n\n"
+        
+        "## 💡 consultation\n"
+        "Người dùng muốn TƯ VẤN dựa trên tình huống:\n"
+        "- Giải quyết vấn đề: 'đất tôi bị chua, làm sao'\n"
+        "- Đề xuất hành động: 'nên bón phân gì', 'khi nào thu hoạch'\n"
+        "- Tối ưu hóa: 'tăng năng suất', 'giảm chi phí'\n"
+        "→ data_needs: ['sensor_data', 'knowledge_base']\n\n"
+        
+        "# LUẬT QUAN TRỌNG:\n"
+        "1. Nếu KHÔNG liên quan nông nghiệp → intent = 'small_talk', data_needs = []\n"
+        "2. Nếu hỏi SỐ LIỆU/TRẠNG THÁI → bắt buộc có 'sensor_data'\n"
+        "3. Nếu chỉ hỏi KIẾN THỨC → chỉ cần 'knowledge_base'\n"
+        "4. Nếu TƯ VẤN → cần cả hai\n"
+        "5. MỞ RỘNG câu hỏi với thuật ngữ chuyên môn\n\n"
+        
+        "# VÍ DỤ:\n\n"
+        "Input: 'xin chào'\n"
+        "Output: {\"intent\": \"small_talk\", \"enhanced_query\": \"xin chào\", \"data_needs\": [], \"context\": \"Chào hỏi xã giao\"}\n\n"
+        
+        "Input: 'kiểm tra đất'\n"
+        "Output: {\"intent\": \"check_sensor_data\", \"enhanced_query\": \"Kiểm tra các chỉ số đất: NPK (Nitơ, Lân, Kali), pH, độ ẩm đất, nhiệt độ đất\", \"data_needs\": [\"sensor_data\", \"knowledge_base\"], \"context\": \"Kiểm tra tình trạng đất\"}\n\n"
+        
+        "# OUTPUT FORMAT:\n"
+        "Trả về JSON hợp lệ (KHÔNG dùng markdown ```json):\n"
+        "{\"intent\": \"...\", \"enhanced_query\": \"...\", \"data_needs\": [...], \"context\": \"...\"}\n\n"
+        
+        "Bây giờ hãy phân tích câu hỏi sau:"
     ))
     
-    original_query = state["messages"][-1].content if state["messages"] else state.get("original_query", "")
+    original_query = state.get("original_query", "")
+    print(f"\n[Query Enhancement] Analyzing: '{original_query}'")
     
     messages = [system, HumanMessage(content=original_query)]
     result = await workflow.llm_router.ainvoke(messages)
     
-    # Nhận diện câu đơn giản, chào hỏi, không liên quan nông nghiệp
-    if any(greet in original_query.lower() for greet in ["xin chào", "hello", "hi", "chào bạn"]):
-        enhanced = {
-            "intent": "small_talk",
-            "enhanced_query": original_query,
-            "data_needs": [],  # Không cần gọi tool
-            "context": "Người dùng chỉ chào hỏi, không yêu cầu thông tin nông nghiệp"
-        }
-    else:
-        # Parse enhanced query
-        try:
-            content = result.content.strip()
-            # Remove markdown code blocks if present
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            enhanced = json.loads(content.strip())
-        except Exception as e:
-            print(f"[Query Enhancement] Parse error: {e}, using default")
+    # Parse JSON response
+    try:
+        content = result.content.strip()
+        # Remove markdown code blocks if present
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        enhanced = json.loads(content.strip())
+    except Exception as e:
+        print(f"[Query Enhancement] Parse error: {e}, using fallback")
+        # Fallback: check if it's small talk manually
+        if any(pattern in original_query.lower() for pattern in [
+            "xin chào", "hello", "hi", "chào",
+            "tôi là", "mình là", "tên tôi", "tên mình",
+            "bạn là ai", "tôi là ai", "ai đó",
+            "cảm ơn", "thank", "bye", "tạm biệt"
+        ]):
+            enhanced = {
+                "intent": "small_talk",
+                "enhanced_query": original_query,
+                "data_needs": [],
+                "context": "Câu hỏi không liên quan nông nghiệp"
+            }
+        else:
             enhanced = {
                 "intent": "ask_knowledge",
                 "enhanced_query": original_query,
                 "data_needs": ["knowledge_base"],
                 "context": ""
             }
-        
+    
+    print(f"[Query Enhancement] Intent: {enhanced.get('intent')}, Data needs: {enhanced.get('data_needs')}")
+    
     return {
-        "original_query": original_query,
         "enhanced_query": enhanced.get("enhanced_query", original_query),
         "tool_plan": enhanced,
         "messages": [AIMessage(content=f"[Enhanced Query: {enhanced.get('enhanced_query')}]")]
@@ -191,13 +303,22 @@ async def query_enhancement_agent(state: State, workflow: Workflow):
 
 async def tool_execution_agent(state: State, workflow: Workflow):
     """
-    Tool Execution Agent - BẮT BUỘC gọi tools
-    - Gọi tools dựa trên tool_plan
-    - Thu thập dữ liệu từ sensors và knowledge base
+    Tool Execution Agent - Gọi tools dựa trên tool_plan
     """
     tool_plan = state.get("tool_plan", {})
-    data_needs = tool_plan.get("data_needs", ["knowledge_base"])
+    data_needs = tool_plan.get("data_needs", [])
     enhanced_query = state.get("enhanced_query", state.get("original_query", ""))
+    
+    # Nếu intent là small_talk, KHÔNG gọi tools
+    if tool_plan.get("intent") == "small_talk" or not data_needs:
+        print(f"[Tool Execution] Skipping tools for small_talk")
+        return {
+            "sensor_data": {},
+            "kb_context": "",
+            "has_kb_data": False,
+            "has_sensor_data": False,
+            "messages": [ToolMessage(content="Skipped tools for small talk", tool_call_id="none")]
+        }
     
     sensor_data = {}
     kb_context = ""
@@ -209,7 +330,7 @@ async def tool_execution_agent(state: State, workflow: Workflow):
     print(f"[Tool Execution] Data needs: {data_needs}")
     
     # 1. GỌI SENSOR TOOL (nếu cần)
-    if "sensor_data" in data_needs or "soil_sensors" in data_needs:
+    if "sensor_data" in data_needs:
         print(f"[Tool Execution] Calling sensorthings_search...")
         try:
             sensor_result = await sensorthings_search.ainvoke(enhanced_query)
@@ -237,32 +358,33 @@ async def tool_execution_agent(state: State, workflow: Workflow):
             )
             print(f"[Tool Execution] ❌ Sensor error: {e}")
     
-    # 2. GỌI KNOWLEDGE BASE TOOL (bắt buộc)
-    print(f"[Tool Execution] Calling search_knowledge_base...")
-    try:
-        kb_result = await workflow.search_knowledge_base.ainvoke(enhanced_query)
-        print(f"[Tool Execution] KB result length: {len(str(kb_result))}")
-        
-        if kb_result and len(str(kb_result).strip()) > 10:
-            kb_context = kb_result
-            has_kb_data = True
+    # 2. GỌI KNOWLEDGE BASE TOOL (nếu cần)
+    if "knowledge_base" in data_needs:
+        print(f"[Tool Execution] Calling search_knowledge_base...")
+        try:
+            kb_result = await workflow.search_knowledge_base.ainvoke(enhanced_query)
+            print(f"[Tool Execution] KB result length: {len(str(kb_result))}")
+            
+            if kb_result and len(str(kb_result).strip()) > 10:
+                kb_context = kb_result
+                has_kb_data = True
+                tool_messages.append(
+                    ToolMessage(content=kb_result, tool_call_id="kb_tool")
+                )
+                print(f"[Tool Execution] ✅ Got KB data")
+            else:
+                kb_context = "Không tìm thấy thông tin liên quan trong cơ sở kiến thức."
+                tool_messages.append(
+                    ToolMessage(content=kb_context, tool_call_id="kb_tool")
+                )
+                print(f"[Tool Execution] ⚠️ No KB data")
+        except Exception as e:
+            error_msg = f"Lỗi khi tìm kiếm knowledge base: {str(e)}"
+            kb_context = error_msg
             tool_messages.append(
-                ToolMessage(content=kb_result, tool_call_id="kb_tool")
+                ToolMessage(content=error_msg, tool_call_id="kb_tool")
             )
-            print(f"[Tool Execution] ✅ Got KB data")
-        else:
-            kb_context = "Không tìm thấy thông tin liên quan trong cơ sở kiến thức."
-            tool_messages.append(
-                ToolMessage(content=kb_context, tool_call_id="kb_tool")
-            )
-            print(f"[Tool Execution] ⚠️ No KB data")
-    except Exception as e:
-        error_msg = f"Lỗi khi tìm kiếm knowledge base: {str(e)}"
-        kb_context = error_msg
-        tool_messages.append(
-            ToolMessage(content=error_msg, tool_call_id="kb_tool")
-        )
-        print(f"[Tool Execution] ❌ KB error: {e}")
+            print(f"[Tool Execution] ❌ KB error: {e}")
     
     return {
         "sensor_data": sensor_data,
@@ -273,13 +395,98 @@ async def tool_execution_agent(state: State, workflow: Workflow):
     }
 
 
+async def small_talk_response_agent(state: State, workflow: Workflow):
+    """
+    Agent chuyên xử lý small talk
+    """
+    original_query = state.get("original_query", "").lower()
+    
+    # Phân loại loại small talk
+    if any(greet in original_query for greet in ["xin chào", "hello", "hi", "chào"]):
+        response = (
+            "Xin chào! 👋 Tôi là trợ lý nông nghiệp thông minh. "
+            "Tôi có thể giúp bạn:\n\n"
+            "📊 Kiểm tra dữ liệu cảm biến (nhiệt độ, độ ẩm, NPK, pH)\n"
+            "📚 Tư vấn kỹ thuật canh tác\n"
+            "💡 Giải đáp thắc mắc về cây trồng\n\n"
+            "Bạn cần hỗ trợ gì không?"
+        )
+    
+    elif any(intro in original_query for intro in ["tôi là", "mình là", "tên tôi", "tên mình"]):
+        name = ""
+        if "tôi là" in original_query:
+            name = original_query.split("tôi là")[-1].strip()
+        elif "mình là" in original_query:
+            name = original_query.split("mình là")[-1].strip()
+        
+        if name:
+            response = (
+                f"Chào {name.title()}! 🌾 Rất vui được làm quen.\n\n"
+                f"Tôi là trợ lý nông nghiệp, có thể giúp bạn:\n"
+                f"- Kiểm tra dữ liệu đất và cây trồng\n"
+                f"- Tư vấn bón phân, chăm sóc cây\n"
+                f"- Giải đáp về sâu bệnh\n\n"
+                f"Bạn đang trồng gì và cần hỗ trợ gì không?"
+            )
+        else:
+            response = (
+                "Chào bạn! Rất vui được làm quen. "
+                "Tôi có thể giúp bạn với các vấn đề về nông nghiệp. "
+                "Bạn cần hỗ trợ gì không?"
+            )
+    
+    elif any(who in original_query for who in ["bạn là ai", "tên bạn", "ai đó", "tôi là ai"]):
+        if "tôi là ai" in original_query:
+            response = (
+                "Tôi là trợ lý AI nông nghiệp, tôi không có thông tin về danh tính của bạn. 🤔\n\n"
+                "Nhưng tôi có thể giúp bạn với:\n"
+                "- Phân tích đất\n"
+                "- Tư vấn cây trồng\n"
+                "- Giải đáp kỹ thuật\n\n"
+                "Bạn có câu hỏi gì về nông nghiệp không?"
+            )
+        else:
+            response = (
+                "Tôi là trợ lý nông nghiệp thông minh! 🤖🌾\n\n"
+                "Tôi được tạo ra để hỗ trợ nông dân với:\n"
+                "✅ Dữ liệu từ cảm biến IoT\n"
+                "✅ Kiến thức canh tác hiện đại\n"
+                "✅ Tư vấn chuyên sâu\n\n"
+                "Bạn cần giúp gì về nông nghiệp không?"
+            )
+    
+    elif any(thanks in original_query for thanks in ["cảm ơn", "thanks", "thank you"]):
+        response = (
+            "Không có gì! 😊 Rất vui được hỗ trợ bạn.\n\n"
+            "Nếu có thêm câu hỏi về nông nghiệp, cứ hỏi tôi bất cứ lúc nào nhé! 🌱"
+        )
+    
+    elif any(bye in original_query for bye in ["bye", "tạm biệt", "hẹn gặp lại"]):
+        response = (
+            "Tạm biệt! 👋 Chúc bạn mùa màng bội thu! 🌾\n\n"
+            "Hẹn gặp lại bạn sớm!"
+        )
+    
+    else:
+        response = (
+            "Tôi là trợ lý nông nghiệp. Tôi có thể giúp bạn với các câu hỏi về:\n"
+            "- Kiểm tra dữ liệu cảm biến\n"
+            "- Kỹ thuật canh tác\n"
+            "- Chăm sóc cây trồng\n\n"
+            "Bạn có câu hỏi gì không?"
+        )
+    
+    print(f"[Small Talk Response] Generated response length: {len(response)}")
+    
+    return {
+        "draft_response": response,
+        "messages": [AIMessage(content=response)]
+    }
+
+
 async def response_generation_agent(state: State, workflow: Workflow):
     """
     Response Generation Agent (STREAMING ENABLED)
-    - CHỈ trả lời dựa trên dữ liệu từ tools
-    - Nếu không có dữ liệu → nói không biết
-    
-    FIX: Không truyền ToolMessage vào LLM, chỉ truyền data dạng text
     """
     has_sensor_data = state.get("has_sensor_data", False)
     has_kb_data = state.get("has_kb_data", False)
@@ -288,15 +495,17 @@ async def response_generation_agent(state: State, workflow: Workflow):
     qa_feedback = state.get("qa_feedback", {})
     original_query = state.get("original_query", "")
     
+    print(f"\n[Response Generation] Starting...")
+    print(f"[Response Generation] Has sensor data: {has_sensor_data}, Has KB data: {has_kb_data}")
+    
     # KIỂM TRA có dữ liệu không
     if not has_kb_data and not has_sensor_data:
-        # KHÔNG CÓ DỮ LIỆU → Trả lời không biết
         no_data_response = AIMessage(content=(
-            "Xin lỗi, tôi không tìm thấy thông tin về câu hỏi này trong cơ sở dữ liệu. "
+            "Xin lỗi, tôi không tìm thấy thông tin về câu hỏi này trong cơ sở dữ liệu. 🤔\n\n"
             "Vui lòng hỏi các câu hỏi liên quan đến:\n"
-            "- Kỹ thuật trồng trọt\n"
-            "- Bón phân và chăm sóc cây\n"
-            "- Kiểm tra dữ liệu cảm biến (nhiệt độ, độ ẩm, NPK, pH)"
+            "- Kỹ thuật trồng trọt 🌱\n"
+            "- Bón phân và chăm sóc cây 💧\n"
+            "- Kiểm tra dữ liệu cảm biến (nhiệt độ, độ ẩm, NPK, pH) 📊"
         ))
         return {
             "draft_response": no_data_response.content,
@@ -339,6 +548,7 @@ async def response_generation_agent(state: State, workflow: Workflow):
             "2. Đưa ra các bước cụ thể\n"
             "3. Số liệu chính xác (nếu có)\n"
             "4. Ngắn gọn, dễ hiểu\n"
+            "5. Dùng emoji để dễ đọc\n"
         )
         data_context = f"\n\n--- KNOWLEDGE BASE ---\n{kb_context}"
     
@@ -356,8 +566,7 @@ async def response_generation_agent(state: State, workflow: Workflow):
     if qa_feedback.get("needs_improvement"):
         system_prompt += f"\n\nCẢI THIỆN DỰA TRÊN FEEDBACK:\n{qa_feedback.get('suggestions', '')}"
     
-    # QUAN TRỌNG: Chỉ dùng SystemMessage và HumanMessage
-    # KHÔNG dùng ToolMessage vì không có AIMessage với tool_calls đứng trước
+    # Tạo messages cho LLM
     system = SystemMessage(content=system_prompt)
     human = HumanMessage(content=f"Câu hỏi: {original_query}{data_context}")
     
@@ -365,23 +574,30 @@ async def response_generation_agent(state: State, workflow: Workflow):
     
     # STREAM response
     try:
+        print(f"[Response Generation] Invoking LLM...")
         result = await workflow.llm.ainvoke(messages)
+        
+        print(f"[Response Generation] ✅ Generated response length: {len(result.content)}")
         
         return {
             "draft_response": result.content,
             "messages": [result]
         }
     except asyncio.CancelledError:
-        # Khi bị hủy bởi LangGraph/LangSmith, ta không cần xem là lỗi
-        print("Responder task was cancelled (likely by LangGraph).")
+        print("[Response Generation] Task was cancelled (likely by LangGraph).")
         return None
+    except Exception as e:
+        print(f"[Response Generation] ❌ Error: {e}")
+        error_response = AIMessage(content=f"Xin lỗi, đã có lỗi xảy ra: {str(e)}")
+        return {
+            "draft_response": error_response.content,
+            "messages": [error_response]
+        }
 
 
 async def quality_assurance_agent(state: State, workflow: Workflow):
     """
     Quality Assurance Agent
-    - Kiểm tra có trả lời đúng dựa trên dữ liệu không
-    - Có bịa thông tin không
     """
     system = SystemMessage(content=(
         "Bạn là QA Agent - kiểm tra chất lượng câu trả lời.\n\n"
@@ -396,11 +612,11 @@ async def quality_assurance_agent(state: State, workflow: Workflow):
         "- Thiếu phân tích quan trọng\n\n"
         "OUTPUT FORMAT:\n"
         "{\n"
-        "  'score': 0-100,\n"
-        "  'needs_improvement': true/false,\n"
-        "  'strengths': ['điểm mạnh 1'],\n"
-        "  'weaknesses': ['điểm yếu 1'],\n"
-        "  'suggestions': 'Cải thiện cụ thể...'\n"
+        "  \"score\": 0-100,\n"
+        "  \"needs_improvement\": true/false,\n"
+        "  \"strengths\": [\"điểm mạnh 1\"],\n"
+        "  \"weaknesses\": [\"điểm yếu 1\"],\n"
+        "  \"suggestions\": \"Cải thiện cụ thể...\"\n"
         "}\n"
     ))
     
@@ -408,7 +624,7 @@ async def quality_assurance_agent(state: State, workflow: Workflow):
     original_query = state.get("original_query", "")
     has_sensor_data = state.get("has_sensor_data", False)
     has_kb_data = state.get("has_kb_data", False)
-    kb_context = state.get("kb_context", "")[:500]  # First 500 chars
+    kb_context = state.get("kb_context", "")[:500]
     
     evaluation_prompt = f"""
 CÂU HỎI: {original_query}
@@ -427,24 +643,21 @@ CÂU TRẢ LỜI:
     messages = [system, HumanMessage(content=evaluation_prompt)]
     result = await workflow.llm_router.ainvoke(messages)
     
-    # Parse QA feedback (ROBUST PARSING)
+    # Parse QA feedback
     try:
         content = result.content.strip()
         
         # Remove markdown code blocks
         if content.startswith("```"):
             lines = content.split("\n")
-            content = "\n".join(lines[1:-1])  # Remove first and last lines
+            content = "\n".join(lines[1:-1])
             if content.startswith("json"):
                 content = content[4:].strip()
         
-        # Replace single quotes with double quotes for JSON compatibility
         content = content.replace("'", '"')
-        
         qa_feedback = json.loads(content.strip())
     except Exception as e:
         print(f"[QA] Parse error: {e}")
-        print(f"[QA] Raw content: {result.content[:200]}")
         qa_feedback = {
             "score": 85,
             "needs_improvement": False,
@@ -454,6 +667,8 @@ CÂU TRẢ LỜI:
         }
     
     needs_improvement = qa_feedback.get("needs_improvement", False)
+    
+    print(f"[QA] Score: {qa_feedback.get('score')}/100, Needs improvement: {needs_improvement}")
     
     return {
         "qa_feedback": qa_feedback,
@@ -470,6 +685,8 @@ def supervisor_router(state: State) -> str:
     """Route dựa trên quyết định của supervisor"""
     next_agent = state.get("next_agent", "end")
     
+    print(f"[Router] Routing to: {next_agent}")
+    
     if next_agent == "end":
         return "end"
     
@@ -480,6 +697,9 @@ def supervisor_router(state: State) -> str:
 # Build Graph
 # --------------------------
 def build_graph(workflow: Workflow):
+    """
+    ✅ Build LangGraph with proper state management
+    """
     graph_builder = StateGraph(State)
     
     # Add all agent nodes
@@ -488,6 +708,7 @@ def build_graph(workflow: Workflow):
     graph_builder.add_node("tool_execution", partial(tool_execution_agent, workflow=workflow))
     graph_builder.add_node("response_generation", partial(response_generation_agent, workflow=workflow))
     graph_builder.add_node("quality_assurance", partial(quality_assurance_agent, workflow=workflow))
+    graph_builder.add_node("small_talk_response", partial(small_talk_response_agent, workflow=workflow))
     
     # Set entry point
     graph_builder.set_entry_point("supervisor")
@@ -501,6 +722,7 @@ def build_graph(workflow: Workflow):
             "tool_execution": "tool_execution",
             "response_generation": "response_generation",
             "quality_assurance": "quality_assurance",
+            "small_talk_response": "small_talk_response",
             "end": END
         }
     )
@@ -510,6 +732,7 @@ def build_graph(workflow: Workflow):
     graph_builder.add_edge("tool_execution", "supervisor")
     graph_builder.add_edge("response_generation", "supervisor")
     graph_builder.add_edge("quality_assurance", "supervisor")
+    graph_builder.add_edge("small_talk_response", "supervisor")
     
     return graph_builder.compile(checkpointer=memory)
 
@@ -527,7 +750,8 @@ async def run_agent(query: str, retriever, thread_id: str = "default"):
     initial_state = {
         "messages": [HumanMessage(content=query)],
         "original_query": query,
-        "iteration_count": 0
+        "iteration_count": 0,
+        "conversation_stage": "new_turn"  # ✅ Đánh dấu đây là turn mới
     }
     
     final_state = await graph.ainvoke(initial_state, config)
