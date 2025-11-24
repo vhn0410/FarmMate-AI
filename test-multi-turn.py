@@ -1,215 +1,413 @@
 """
-Test script để kiểm tra memory trong multi-turn conversation
+🧪 MEMORY TEST SUITE - MongoDB Store Validation
+Test cross-thread memory persistence
 """
+
+import asyncio
 import requests
 import json
+from typing import Optional
 import time
 
+# Server configuration
 BASE_URL = "http://localhost:8000"
 
-def print_separator(title=""):
+def print_header(text: str):
+    """Print formatted section header"""
     print("\n" + "=" * 70)
-    if title:
-        print(f"  {title}")
-        print("=" * 70)
+    print(f"  {text}")
+    print("=" * 70)
 
-def send_message(message: str, checkpoint_id: str = None):
+def print_subheader(text: str):
+    """Print formatted subsection header"""
+    print(f"\n{'─' * 70}")
+    print(f"  {text}")
+    print(f"{'─' * 70}")
+
+def stream_chat(message: str, user_id: str, checkpoint_id: Optional[str] = None):
     """
-    Gửi message và nhận streaming response
+    Stream chat response from API
+    Returns (response_text, checkpoint_id)
     """
+    url = f"{BASE_URL}/chat_stream"
+    params = {
+        "message": message,
+        "user_id": user_id
+    }
     if checkpoint_id:
-        url = f"{BASE_URL}/chat_stream?message={requests.utils.quote(message)}&checkpoint_id={checkpoint_id}"
-    else:
-        url = f"{BASE_URL}/chat_stream?message={requests.utils.quote(message)}"
+        params["checkpoint_id"] = checkpoint_id
     
-    print(f"\n🗣️  User: {message}")
-    print(f"🤖 Bot: ", end="", flush=True)
-    
-    response = requests.get(url, stream=True)
+    response_text = ""
     new_checkpoint = checkpoint_id
-    full_response = ""
     
-    for line in response.iter_lines():
-        if line:
-            data = line.decode().replace("data: ", "")
-            try:
-                event = json.loads(data)
-                
-                if event["type"] == "checkpoint":
-                    new_checkpoint = event["checkpoint_id"]
-                    print(f"\n   [Checkpoint: {new_checkpoint[:8]}...]")
-                    print(f"🤖 Bot: ", end="", flush=True)
-                
-                elif event["type"] == "content":
-                    content = event["content"]
-                    print(content, end="", flush=True)
-                    full_response += content
-                
-                elif event["type"] == "end":
-                    print()  # New line after response
-                
-                elif event["type"] == "error":
-                    print(f"\n❌ Error: {event['message']}")
-            except json.JSONDecodeError:
-                pass
+    try:
+        response = requests.get(url, params=params, stream=True, timeout=60)
+        
+        for line in response.iter_lines():
+            if line:
+                decoded = line.decode('utf-8')
+                if decoded.startswith('data: '):
+                    data_str = decoded[6:]  # Remove 'data: ' prefix
+                    try:
+                        data = json.loads(data_str)
+                        
+                        if data.get("type") == "checkpoint":
+                            new_checkpoint = data.get("checkpoint_id")
+                            print(f"   [Checkpoint: {new_checkpoint[:8]}...]")
+                        
+                        elif data.get("type") == "content":
+                            content = data.get("content", "")
+                            response_text += content
+                            print(content, end='', flush=True)
+                        
+                        elif data.get("type") == "end":
+                            print()  # Newline after response
+                            break
+                        
+                        elif data.get("type") == "error":
+                            print(f"\n❌ Error: {data.get('message')}")
+                            break
+                    
+                    except json.JSONDecodeError:
+                        pass
+        
+        return response_text, new_checkpoint
     
-    return new_checkpoint, full_response
+    except Exception as e:
+        print(f"❌ Request error: {e}")
+        return "", checkpoint_id
 
+def get_user_memory(user_id: str):
+    """Get user's long-term memory from API"""
+    try:
+        response = requests.get(f"{BASE_URL}/user_memory/{user_id}", timeout=10)
+        data = response.json()
+        
+        if data.get("success"):
+            return data.get("memory", {})
+        else:
+            return {}
+    except Exception as e:
+        print(f"❌ Error getting memory: {e}")
+        return {}
 
-def test_memory_conversation():
+def delete_user_memory(user_id: str):
+    """Delete user's memory"""
+    try:
+        response = requests.delete(f"{BASE_URL}/user_memory/{user_id}", timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"❌ Error deleting memory: {e}")
+        return {}
+
+def check_health():
+    """Check if server is running"""
+    try:
+        response = requests.get(f"{BASE_URL}/health", timeout=5)
+        data = response.json()
+        return data.get("status") == "ok"
+    except:
+        return False
+
+# --------------------------
+# Test Functions
+# --------------------------
+
+def test_memory_persistence():
     """
-    Test case: Memory trong multi-turn conversation
+    Test 1: Memory persists across different threads
     """
-    print_separator("🧪 MEMORY TEST - Multi-Turn Conversation")
+    print_header("🧪 TEST 1: MEMORY PERSISTENCE ACROSS THREADS")
     
-    checkpoint = None
+    user_id = "test_user_hoang_vu"
     
-    # Turn 1: Giới thiệu tên
-    print_separator("TURN 1: Giới thiệu")
-    checkpoint, _ = send_message("xin chào, tôi tên là Hoàng Vũ", checkpoint)
+    # Clean slate
+    print("🧹 Cleaning old memory...")
+    delete_user_memory(user_id)
     time.sleep(1)
     
-    # Turn 2: Hỏi lại tên (kiểm tra memory)
-    print_separator("TURN 2: Kiểm tra memory - Tôi là ai?")
-    checkpoint, response2 = send_message("tôi là ai?", checkpoint)
-    time.sleep(1)
+    # Turn 1: User introduces themselves
+    print_subheader("TURN 1: User Introduction")
+    print(f"🗣️  User: xin chào, tôi tên là Hoàng Vũ")
+    print("🤖 Bot: ")
+    response1, checkpoint1 = stream_chat(
+        message="xin chào, tôi tên là Hoàng Vũ",
+        user_id=user_id
+    )
     
-    # Turn 3: Hỏi câu trước (kiểm tra conversation history)
-    print_separator("TURN 3: Kiểm tra conversation history")
-    checkpoint, response3 = send_message("tôi vừa hỏi gì?", checkpoint)
-    time.sleep(1)
+    # Turn 2: Add crop info (same thread)
+    print_subheader("TURN 2: Add Crop Info (Same Thread)")
+    print(f"🗣️  User: tôi đang trồng lúa ở Cần Thơ")
+    print("🤖 Bot: ")
+    response2, checkpoint1 = stream_chat(
+        message="tôi đang trồng lúa ở Cần Thơ",
+        user_id=user_id,
+        checkpoint_id=checkpoint1
+    )
     
-    # Turn 4: Giới thiệu thêm thông tin
-    print_separator("TURN 4: Thêm thông tin")
-    checkpoint, _ = send_message("tôi đang trồng lúa ở Cần Thơ", checkpoint)
-    time.sleep(1)
+    # Check memory
+    print_subheader("MEMORY CHECK")
+    memory = get_user_memory(user_id)
+    print(f"📋 User Memory:")
+    print(f"   Name: {memory.get('name', 'Not set')}")
+    print(f"   Crop: {memory.get('crop_type', 'Not set')}")
+    print(f"   Location: {memory.get('location', 'Not set')}")
     
-    # Turn 5: Hỏi lại thông tin vừa chia sẻ
-    print_separator("TURN 5: Kiểm tra long-term memory")
-    checkpoint, response5 = send_message("tôi đang trồng gì?", checkpoint)
-    time.sleep(1)
-    
-    # Turn 6: Context-aware question
-    print_separator("TURN 6: Context-aware query")
-    checkpoint, response6 = send_message("nó phù hợp với khí hậu ở đó không?", checkpoint)
+    # Turn 3: NEW THREAD - Check if memory persists
+    print_subheader("TURN 3: NEW THREAD - Memory Test")
+    print(f"🗣️  User: tôi là ai?")
+    print("🤖 Bot: ")
+    response3, checkpoint2 = stream_chat(
+        message="tôi là ai?",
+        user_id=user_id
+        # Note: No checkpoint_id = new thread!
+    )
     
     # Validation
-    print_separator("📊 MEMORY VALIDATION")
+    print_subheader("📊 VALIDATION")
     
-    checks = [
-        ("Turn 2: Nhớ tên 'Hoàng Vũ'", "hoàng vũ" in response2.lower() or "hoang vu" in response2.lower()),
-        ("Turn 3: Nhớ câu hỏi trước", "tôi là ai" in response3.lower() or "là ai" in response3.lower()),
-        ("Turn 5: Nhớ thông tin cây trồng", "lúa" in response5.lower()),
-        ("Turn 6: Hiểu context 'nó'", "lúa" in response6.lower() or "cần thơ" in response6.lower()),
-    ]
+    # Check if bot remembered the name
+    success_name = "Hoàng Vũ" in response3 or "hoàng vũ" in response3.lower()
     
-    passed = 0
-    for check_name, result in checks:
+    if success_name:
+        print("✅ PASS - Bot remembers user name across threads!")
+    else:
+        print("❌ FAIL - Bot forgot user name")
+        print(f"   Expected: Contains 'Hoàng Vũ'")
+        print(f"   Got: {response3[:100]}...")
+    
+    # Turn 4: Another NEW THREAD - Check crop memory
+    print_subheader("TURN 4: ANOTHER NEW THREAD - Crop Test")
+    print(f"🗣️  User: tôi đang trồng gì?")
+    print("🤖 Bot: ")
+    response4, checkpoint3 = stream_chat(
+        message="tôi đang trồng gì?",
+        user_id=user_id
+        # Another new thread!
+    )
+    
+    success_crop = "lúa" in response4.lower()
+    success_location = "cần thơ" in response4.lower()
+    
+    if success_crop and success_location:
+        print("\n✅ PASS - Bot remembers crop and location!")
+    elif success_crop:
+        print("\n⚠️  PARTIAL - Bot remembers crop but not location")
+    else:
+        print("\n❌ FAIL - Bot forgot crop information")
+    
+    return all([success_name, success_crop, success_location])
+
+def test_context_awareness():
+    """
+    Test 2: Context-aware responses using memory
+    """
+    print_header("🧪 TEST 2: CONTEXT-AWARE RESPONSES")
+    
+    user_id = "test_user_alice"
+    
+    # Clean slate
+    delete_user_memory(user_id)
+    time.sleep(1)
+    
+    # Turn 1: Set context
+    print_subheader("TURN 1: Set Context")
+    print(f"🗣️  User: tôi tên là Alice, đang trồng cà chua ở Đà Lạt")
+    print("🤖 Bot: ")
+    response1, checkpoint1 = stream_chat(
+        message="tôi tên là Alice, đang trồng cà chua ở Đà Lạt",
+        user_id=user_id
+    )
+    
+    # Turn 2: Pronoun reference (new thread)
+    print_subheader("TURN 2: Pronoun Reference (New Thread)")
+    print(f"🗣️  User: nó phù hợp với khí hậu ở đó không?")
+    print("🤖 Bot: ")
+    response2, checkpoint2 = stream_chat(
+        message="nó phù hợp với khí hậu ở đó không?",
+        user_id=user_id
+    )
+    
+    # Validation
+    print_subheader("📊 VALIDATION")
+    
+    # Bot should understand "nó" = cà chua, "ở đó" = Đà Lạt
+    mentions_tomato = "cà chua" in response2.lower()
+    mentions_dalat = "đà lạt" in response2.lower() or "dalat" in response2.lower()
+    
+    if mentions_tomato and mentions_dalat:
+        print("✅ PASS - Bot understands context (pronouns)")
+    elif mentions_tomato or mentions_dalat:
+        print("⚠️  PARTIAL - Bot partially understands context")
+    else:
+        print("❌ FAIL - Bot doesn't understand context")
+    
+    return mentions_tomato and mentions_dalat
+
+def test_user_isolation():
+    """
+    Test 3: Memory is isolated between different users
+    """
+    print_header("🧪 TEST 3: USER ISOLATION")
+    
+    user1 = "test_user_bob"
+    user2 = "test_user_charlie"
+    
+    # Clean
+    delete_user_memory(user1)
+    delete_user_memory(user2)
+    time.sleep(1)
+    
+    # User 1 introduces
+    print_subheader("USER 1: Bob")
+    print(f"🗣️  Bob: tôi tên là Bob, trồng lúa")
+    print("🤖 Bot: ")
+    response1, _ = stream_chat(
+        message="tôi tên là Bob, trồng lúa",
+        user_id=user1
+    )
+    
+    # User 2 introduces
+    print_subheader("USER 2: Charlie")
+    print(f"🗣️  Charlie: tôi tên là Charlie, trồng cà phê")
+    print("🤖 Bot: ")
+    response2, _ = stream_chat(
+        message="tôi tên là Charlie, trồng cà phê",
+        user_id=user2
+    )
+    
+    # User 1 asks who they are
+    print_subheader("USER 1 MEMORY CHECK")
+    print(f"🗣️  Bob: tôi là ai?")
+    print("🤖 Bot: ")
+    response3, _ = stream_chat(
+        message="tôi là ai?",
+        user_id=user1
+    )
+    
+    # Validation
+    print_subheader("📊 VALIDATION")
+    
+    user1_correct = "Bob" in response3 and "lúa" in response3
+    user1_no_leak = "Charlie" not in response3 and "cà phê" not in response3
+    
+    if user1_correct and user1_no_leak:
+        print("✅ PASS - Memory is properly isolated")
+        print("   User 1 only sees their own data")
+    else:
+        print("❌ FAIL - Memory leak detected!")
+        if not user1_correct:
+            print("   User 1 doesn't see their own data")
+        if not user1_no_leak:
+            print("   User 1 sees User 2's data (SECURITY ISSUE!)")
+    
+    return user1_correct and user1_no_leak
+
+def test_small_talk_memory():
+    """
+    Test 4: Small talk responses are personalized with memory
+    """
+    print_header("🧪 TEST 4: PERSONALIZED SMALL TALK")
+    
+    user_id = "test_user_david"
+    
+    # Clean
+    delete_user_memory(user_id)
+    time.sleep(1)
+    
+    # First: introduce
+    print_subheader("SETUP: Introduction")
+    print(f"🗣️  User: tôi tên là David")
+    print("🤖 Bot: ")
+    response1, _ = stream_chat(
+        message="tôi tên là David",
+        user_id=user_id
+    )
+    
+    # Test: Greeting in new thread
+    print_subheader("TEST: Greeting (New Thread)")
+    print(f"🗣️  User: xin chào")
+    print("🤖 Bot: ")
+    response2, _ = stream_chat(
+        message="xin chào",
+        user_id=user_id
+    )
+    
+    # Validation
+    print_subheader("📊 VALIDATION")
+    
+    personalized = "David" in response2
+    
+    if personalized:
+        print("✅ PASS - Greeting is personalized with name")
+    else:
+        print("❌ FAIL - Greeting is generic (no personalization)")
+    
+    return personalized
+
+# --------------------------
+# Main Test Runner
+# --------------------------
+
+def main():
+    """Run all memory tests"""
+    
+    print_header("🚀 AGRICULTURAL AI AGENT - MEMORY TEST SUITE")
+    print(f"  Server: {BASE_URL}")
+    
+    # Check server health
+    if not check_health():
+        print("\n❌ ERROR: Server is not running!")
+        print("   Please start server: python app_mongodb.py")
+        return
+    
+    print("  Status: ✅ Server is running")
+    print("=" * 70)
+    
+    results = {}
+    
+    # Run tests
+    try:
+        results['memory_persistence'] = test_memory_persistence()
+        time.sleep(2)
+        
+        results['context_awareness'] = test_context_awareness()
+        time.sleep(2)
+        
+        results['user_isolation'] = test_user_isolation()
+        time.sleep(2)
+        
+        results['personalized_small_talk'] = test_small_talk_memory()
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Tests interrupted by user")
+        return
+    
+    # Summary
+    print_header("📊 TEST SUMMARY")
+    
+    total = len(results)
+    passed = sum(1 for v in results.values() if v)
+    
+    print(f"\n  Tests Run: {total}")
+    print(f"  Passed: {passed}")
+    print(f"  Failed: {total - passed}")
+    print()
+    
+    for test_name, result in results.items():
         status = "✅ PASS" if result else "❌ FAIL"
-        print(f"{status} - {check_name}")
-        if result:
-            passed += 1
+        print(f"  {status} - {test_name.replace('_', ' ').title()}")
     
-    print(f"\n🎯 Score: {passed}/{len(checks)} tests passed")
+    print()
     
-    if passed == len(checks):
-        print("🎉 MEMORY WORKS PERFECTLY!")
-    elif passed >= len(checks) // 2:
-        print("⚠️  MEMORY PARTIALLY WORKING")
+    if passed == total:
+        print("  🎉 ALL TESTS PASSED! Memory system is working correctly!")
+    elif passed > 0:
+        print(f"  ⚠️  {passed}/{total} tests passed. Review failed tests.")
     else:
-        print("❌ MEMORY NOT WORKING")
+        print("  ❌ ALL TESTS FAILED! Memory system needs debugging.")
     
-    return checkpoint
-
-
-def test_context_switch():
-    """
-    Test case: Chuyển đổi giữa small talk và agricultural queries
-    """
-    print_separator("🧪 CONTEXT SWITCH TEST")
-    
-    checkpoint = None
-    
-    # Small talk
-    print_separator("PHASE 1: Small Talk")
-    checkpoint, _ = send_message("xin chào", checkpoint)
-    time.sleep(1)
-    
-    # Agricultural query
-    print_separator("PHASE 2: Agricultural Query")
-    checkpoint, _ = send_message("cách trồng lúa hiệu quả", checkpoint)
-    time.sleep(1)
-    
-    # Back to small talk (should still remember previous context)
-    print_separator("PHASE 3: Back to Small Talk (with memory)")
-    checkpoint, response3 = send_message("cảm ơn bạn nhé", checkpoint)
-    time.sleep(1)
-    
-    # Context-aware query
-    print_separator("PHASE 4: Context-aware Query")
-    checkpoint, response4 = send_message("còn gì khác không?", checkpoint)
-    
-    print_separator("✅ CONTEXT SWITCH TEST COMPLETED")
-    return checkpoint
-
-
-def test_new_conversation():
-    """
-    Test case: Conversation mới không bị nhiễm data cũ
-    """
-    print_separator("🧪 NEW CONVERSATION TEST")
-    
-    # Conversation 1
-    print_separator("CONVERSATION 1")
-    checkpoint1 = None
-    checkpoint1, _ = send_message("tôi tên là Alice", checkpoint1)
-    time.sleep(1)
-    
-    # Conversation 2 (new checkpoint - should NOT remember Alice)
-    print_separator("CONVERSATION 2 (New Thread)")
-    checkpoint2 = None
-    checkpoint2, response2 = send_message("tôi là ai?", checkpoint2)
-    
-    # Validation
-    print_separator("📊 ISOLATION VALIDATION")
-    if "alice" not in response2.lower():
-        print("✅ PASS - New conversation does NOT remember old data")
-    else:
-        print("❌ FAIL - New conversation leaked data from old thread")
-    
-    return checkpoint1, checkpoint2
-
+    print("=" * 70)
 
 if __name__ == "__main__":
-    try:
-        # Check if server is running
-        health = requests.get(f"{BASE_URL}/health", timeout=2)
-        if health.status_code != 200:
-            print("❌ Server is not healthy!")
-            exit(1)
-        
-        print("=" * 70)
-        print("  🚀 AGRICULTURAL AI AGENT - MEMORY TEST SUITE")
-        print("=" * 70)
-        print(f"  Server: {BASE_URL}")
-        print(f"  Status: {health.json()['status']}")
-        print("=" * 70)
-        
-        # Run tests
-        test_memory_conversation()
-        print("\n" + "=" * 70 + "\n")
-        
-        test_context_switch()
-        print("\n" + "=" * 70 + "\n")
-        
-        test_new_conversation()
-        
-        print_separator("🎉 ALL TESTS COMPLETED!")
-        
-    except requests.exceptions.ConnectionError:
-        print("❌ Cannot connect to server. Please start the server first:")
-        print("   python app.py")
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Test interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+    main()

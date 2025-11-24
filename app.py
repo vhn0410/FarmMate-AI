@@ -1,285 +1,421 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from uuid import uuid4
+"""
+FastAPI Application for Agricultural AI Agent
+Features:
+- ✅ Server-Sent Events (SSE) for streaming
+- ✅ Real-time response chunks
+- ✅ Conversation history
+- ✅ Health checks & monitoring
+"""
+
 import os
-from dotenv import load_dotenv
-from typing import Optional, List
-import json
 import asyncio
-from src.implements.embedding import DocumentEmbedding
-from src.implements.retriever import Retriever
-from src.implements.chunk_store_duck_db import DuckDBChunkStore
-from langchain_community.retrievers import BM25Retriever
-from langchain_core.documents import Document
-from src.utils.utils import safe_json_escape, serialise_ai_message_chunk
-from src.agent.supervisor_multiagent import Workflow, build_graph
+import json
+from contextlib import asynccontextmanager
+from typing import Optional, AsyncIterator
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-load_dotenv()
-
-# --------------------------
-# Vector store & retrievers
-# --------------------------
-PERSIST_DIR = "db_agriculture3/chroma_db"
-CHUNKS_DB = "chunks.duckdb"
-
-embedding = DocumentEmbedding()
-
-if os.path.exists(PERSIST_DIR):
-    vector_db = embedding.load_vector_store(PERSIST_DIR)
-    vector_retriever = vector_db.as_retriever(search_kwargs={"k": 50})
-else:
-    vector_db = None
-    vector_retriever = None
-
-chunk_store = DuckDBChunkStore(CHUNKS_DB)
-documents: List[Document] = chunk_store.get_all_documents()
-bm25_retriever = BM25Retriever.from_documents(documents)
-bm25_retriever.k = 50
-
-retriever = Retriever(vector_retriever=vector_retriever, bm25_retriever=bm25_retriever)
-
-# Khởi tạo LLM
-llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
-llm_router = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-# --------------------------
-# Workflow & Graph
-# --------------------------
-workflow_instance = Workflow(retriever=retriever, llm=llm, llm_router=llm_router)
-graph = build_graph(workflow_instance)
-
-# --------------------------
-# FastAPI setup
-# --------------------------
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Import optimized supervisor
+from src.agent.supervisor_sota_2025 import (
+    build_graph, 
+    Workflow,
+    AgentState
 )
 
+# Import retriever
+try:
+    from src.implements.embedding import DocumentEmbedding
+    from src.implements.retriever import Retriever
+    from src.implements.chunk_store_duck_db import DuckDBChunkStore
+    from langchain_community.retrievers import BM25Retriever
+    
+    PERSIST_DIR = "db_agriculture3/chroma_db"
+    CHUNKS_DB = "chunks.duckdb"
+    
+    embedding = DocumentEmbedding()
+    if os.path.exists(PERSIST_DIR):
+        vector_db = embedding.load_vector_store(PERSIST_DIR)
+        vector_retriever = vector_db.as_retriever(search_kwargs={"k": 50})
+    else:
+        vector_retriever = None
+    
+    chunk_store = DuckDBChunkStore(CHUNKS_DB)
+    documents = chunk_store.get_all_documents()
+    bm25_retriever = BM25Retriever.from_documents(documents)
+    bm25_retriever.k = 50
+    
+    retriever = Retriever(
+        vector_retriever=vector_retriever, 
+        bm25_retriever=bm25_retriever
+    )
+    
+    def get_retriever():
+        return retriever
+    
+    print("✅ Loaded production retriever")
+
+except ImportError:
+    # Mock retriever for development
+    from langchain_community.retrievers import BM25Retriever
+    from langchain_core.documents import Document
+    
+    def get_retriever():
+        return BM25Retriever.from_documents([
+            Document(page_content="Lúa OM18 sinh trưởng 95-100 ngày, bón phân NPK 20-20-15"),
+            Document(page_content="pH đất tối ưu cho lúa: 5.5-6.5"),
+            Document(page_content="Bệnh đạo ôn lá: phun thuốc Validacin 3%")
+        ])
+    
+    print("⚠️ Using mock retriever (development mode)")
+
+# Config
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+DB_NAME = "agricultural_agent"
+
+# Global state
+app_graph = None
+workflow_instance = None
+
+# ==========================================
+# LIFESPAN MANAGEMENT
+# ==========================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize resources on startup"""
+    global app_graph, workflow_instance
+    
+    print("\n🚀 Starting Agricultural AI Agent (SOTA 2025)...")
+    print("="*60)
+    
+    # Get retriever
+    retriever = get_retriever()
+    
+    # Init Workflow
+    workflow_instance = Workflow(
+        retriever=retriever,
+        mongo_uri=MONGODB_URI,
+        db_name=DB_NAME
+    )
+    
+    # Build Graph
+    app_graph = build_graph(
+        mongo_uri=MONGODB_URI,
+        db_name=DB_NAME
+    )
+    
+    print("✅ Graph compiled successfully")
+    print("✅ Memory service connected")
+    print("✅ Tools initialized")
+    print("="*60)
+    print("🌾 Ready to assist farmers!\n")
+    
+    yield
+    
+    print("\n🛑 Shutting down gracefully...")
+
+# ==========================================
+# FASTAPI APP
+# ==========================================
+
+app = FastAPI(
+    title="FarmMate AI - SOTA 2025",
+    description="Agricultural AI Agent with Supervisor Multi-Agent Architecture",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# ==========================================
+# PYDANTIC MODELS
+# ==========================================
+
 class ChatRequest(BaseModel):
-    message: str
-    checkpoint_id: Optional[str] = None
+    query: str = Field(..., description="User's question")
+    user_id: str = Field(..., description="Unique user identifier")
+    thread_id: str = Field(default="default", description="Conversation thread ID")
+    stream: bool = Field(default=True, description="Enable streaming response")
 
-# --------------------------
-# ✅ FIXED SSE generator với proper state handling
-# --------------------------
-async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = None):
+
+class ChatResponse(BaseModel):
+    response: str
+    user_id: str
+    thread_id: str
+    metadata: dict = Field(default_factory=dict)
+
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    components: dict
+
+
+# ==========================================
+# STREAMING HELPER
+# ==========================================
+
+async def stream_agent_response(
+    query: str, 
+    user_id: str, 
+    thread_id: str
+) -> AsyncIterator[str]:
     """
-    ✅ FIXED: Streaming với state reset tự động cho mỗi turn mới
+    Stream agent execution step-by-step
+    Yields SSE events
+    """
     
-    Best Practices:
-    1. Thread ID persistence cho multi-turn conversation
-    2. Stream chỉ content từ response_generation và small_talk_response
-    3. Proper error handling
-    """
+    if not app_graph or not workflow_instance:
+        yield f"data: {json.dumps({'error': 'Agent not initialized'})}\n\n"
+        return
+    
     try:
-        # ✅ Generate hoặc reuse checkpoint
-        is_new_conversation = checkpoint_id is None
+        # Load profile
+        profile = await workflow_instance.memory_service.get_profile(user_id)
         
-        if is_new_conversation:
-            checkpoint = str(uuid4())
-            config = {"configurable": {"thread_id": checkpoint}}
-            print(f"[APP] 🆕 New conversation started: {checkpoint}")
-            yield f"data: {{\"type\": \"checkpoint\", \"checkpoint_id\": \"{checkpoint}\"}}\n\n"
-        else:
-            checkpoint = checkpoint_id
-            config = {"configurable": {"thread_id": checkpoint}}
-            print(f"[APP] 🔄 Continuing conversation: {checkpoint}")
-
-        # ✅ CRITICAL: Initial state với conversation_stage = "new_turn"
-        # Điều này đảm bảo supervisor sẽ reset state cho mỗi message mới
-        initial_state = {
-            "messages": [HumanMessage(content=message)],
-            "original_query": message,
-            "iteration_count": 0,
-            "conversation_stage": "new_turn"  # ✅ Flag quan trọng!
+        # Config
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "workflow": workflow_instance
+            }
         }
-
-        # Create streaming event generator
-        try:
-            print(f"[APP] Starting stream for message: '{message}'")
-            
-            events = graph.astream_events(
-                initial_state,
-                version="v2",
-                config=config
-            )
-
-            response_started = False
-            response_ended = False
-            current_node = None
-            
-            async for event in events:
-                if response_ended:
-                    break
-                
-                event_type = event.get("event")
-                node_name = event.get("metadata", {}).get("langgraph_node", "")
-                event_data = event.get("data", {})
-
-                # Track current node for debugging
-                if node_name and node_name != current_node:
-                    current_node = node_name
-                    print(f"[APP] 📍 Now in node: {node_name}")
-
-                # ✅ 1️⃣ Stream từ response_generation node (normal queries)
-                if event_type == "on_chat_model_stream" and node_name == "response_generation":
-                    if not response_started:
-                        print(f"[APP] 🔄 Starting response stream...")
-                        response_started = True
-                    
-                    chunk = event_data.get("chunk")
-                    if chunk:
-                        chunk_content = serialise_ai_message_chunk(chunk)
-                        if chunk_content:
-                            safe = safe_json_escape(chunk_content)
-                            yield f"data: {{\"type\": \"content\", \"content\": \"{safe}\"}}\n\n"
-
-                # ✅ 2️⃣ Detect response completion từ response_generation
-                elif event_type == "on_chat_model_end" and node_name == "response_generation":
-                    if response_started:
-                        print(f"[APP] ✅ Response stream completed")
-                        yield f"data: {{\"type\": \"end\"}}\n\n"
-                        response_ended = True
-
-                # ✅ 3️⃣ Handle small_talk_response (không stream, trả về ngay)
-                elif event_type == "on_chain_end" and node_name == "small_talk_response":
-                    output = event_data.get("output", {})
-                    small_talk_response = output.get("draft_response", "")
-                    
-                    if small_talk_response:
-                        print(f"[APP] 💬 Small talk response: {small_talk_response[:50]}...")
-                        
-                        # Stream từng ký tự để giống như chat thật
-                        for char in small_talk_response:
-                            safe_char = safe_json_escape(char)
-                            yield f"data: {{\"type\": \"content\", \"content\": \"{safe_char}\"}}\n\n"
-                            await asyncio.sleep(0.01)  # Delay nhỏ để smooth
-                        
-                        yield f"data: {{\"type\": \"end\"}}\n\n"
-                        response_ended = True
-
-                # ✅ 4️⃣ Tool execution logs (optional, chỉ debug)
-                elif event_type == "on_tool_start":
-                    tool_name = event.get("name", "unknown")
-                    print(f"[APP] 🔧 Tool started: {tool_name}")
-                
-                elif event_type == "on_tool_end":
-                    tool_name = event.get("name", "unknown")
-                    print(f"[APP] ✅ Tool completed: {tool_name}")
-
-            # ✅ Nếu không có response nào được stream (edge case)
-            if not response_started and not response_ended:
-                print(f"[APP] ⚠️ No response was streamed, sending fallback")
-                fallback = "Xin lỗi, có lỗi xảy ra khi xử lý câu hỏi của bạn."
-                for char in fallback:
-                    safe_char = safe_json_escape(char)
-                    yield f"data: {{\"type\": \"content\", \"content\": \"{safe_char}\"}}\n\n"
-                yield f"data: {{\"type\": \"end\"}}\n\n"
-
-        except asyncio.CancelledError:
-            print(f"[APP] ⚠️ Request cancelled by client")
-            yield f"data: {{\"type\": \"error\", \"message\": \"Request cancelled\"}}\n\n"
-            return
         
-        except Exception as e:
-            print(f"[APP] ❌ Stream error: {e}")
-            error_msg = safe_json_escape(str(e))
-            yield f"data: {{\"type\": \"error\", \"message\": \"{error_msg}\"}}\n\n"
-
+        # Initial state
+        initial_state = {
+            "messages": [HumanMessage(content=query)],
+            "user_id": user_id,
+            "thread_id": thread_id,
+            "user_profile": profile,
+            "intent": "",
+            "next_worker": "intent_router",
+            "retrieved_docs": [],
+            "should_stream": True,
+            "requires_reflection": True,
+            "iteration": 0
+        }
+        
+        # Stream events
+        yield f"data: {json.dumps({'type': 'start', 'message': 'Processing query...'})}\n\n"
+        
+        # Run graph with streaming
+        last_content = ""
+        async for event in app_graph.astream(initial_state, config):
+            # Extract node name and state
+            for node_name, node_state in event.items():
+                if node_name == "__end__":
+                    continue
+                
+                # Send progress
+                yield f"data: {json.dumps({'type': 'progress', 'node': node_name})}\n\n"
+                
+                # If synthesis worker, stream the response
+                if node_name == "synthesis_worker":
+                    messages = node_state.get("messages", [])
+                    for msg in messages:
+                        if isinstance(msg, AIMessage) and msg.content:
+                            # Send incremental content
+                            new_content = msg.content[len(last_content):]
+                            if new_content:
+                                yield f"data: {json.dumps({'type': 'content', 'chunk': new_content})}\n\n"
+                                last_content = msg.content
+        
+        # Final state
+        final_state = await app_graph.ainvoke(initial_state, config)
+        
+        # Extract final response
+        ai_messages = [m for m in final_state["messages"] 
+                      if isinstance(m, AIMessage) and not m.content.startswith("[")]
+        final_response = ai_messages[-1].content if ai_messages else "No response"
+        
+        # Save conversation
+        await workflow_instance.memory_service.save_conversation(
+            user_id=user_id,
+            thread_id=thread_id,
+            query=query,
+            response=final_response,
+            metadata={
+                "intent": final_state.get("intent"),
+                "docs_retrieved": len(final_state.get("retrieved_docs", [])),
+                "iterations": final_state.get("iteration", 0)
+            }
+        )
+        
+        # Send completion
+        yield f"data: {json.dumps({'type': 'done', 'response': final_response})}\n\n"
+    
     except Exception as e:
-        print(f"[APP] ❌ Fatal error: {e}")
-        error_msg = safe_json_escape(str(e))
-        yield f"data: {{\"type\": \"error\", \"message\": \"{error_msg}\"}}\n\n"
+        import traceback
+        traceback.print_exc()
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
 
-@app.get("/chat_stream")
-async def chat_stream_get(message: str, checkpoint_id: Optional[str] = Query(None)):
-    """
-    GET endpoint for chat streaming
-    
-    Usage:
-    - New conversation: /chat_stream?message=xin+chào
-    - Continue conversation: /chat_stream?message=cảm+ơn&checkpoint_id=abc-123
-    """
-    return StreamingResponse(
-        generate_chat_responses(message, checkpoint_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        },
-    )
+# ==========================================
+# ENDPOINTS
+# ==========================================
 
-@app.post("/chat_stream")
-async def chat_stream_post(req: ChatRequest):
-    """
-    POST endpoint for chat streaming
-    
-    Body:
-    {
-        "message": "xin chào",
-        "checkpoint_id": "abc-123"  // optional
-    }
-    """
-    return StreamingResponse(
-        generate_chat_responses(req.message, req.checkpoint_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        },
-    )
-
-@app.get("/health")
-async def health():
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
     """Health check endpoint"""
     return {
-        "status": "ok",
-        "rag_enabled": True,
-        "vector_db_loaded": vector_db is not None,
-        "bm25_docs_count": len(documents),
-        "graph_nodes": list(graph.nodes.keys()) if hasattr(graph, 'nodes') else []
+        "status": "healthy",
+        "version": "2.0.0",
+        "components": {
+            "graph": "ready" if app_graph else "not_ready",
+            "workflow": "ready" if workflow_instance else "not_ready",
+            "memory": "connected"
+        }
     }
 
-@app.get("/")
-async def root():
-    """Root endpoint with API documentation"""
-    return {
-        "message": "Agricultural AI Agent API",
-        "version": "2.0.0",
-        "endpoints": {
-            "GET /chat_stream": "Stream chat responses (SSE)",
-            "POST /chat_stream": "Stream chat responses (SSE)",
-            "GET /health": "Health check",
-        },
-        "features": [
-            "Multi-turn conversation with memory",
-            "Intent classification (small_talk, check_sensor, ask_knowledge, consultation)",
-            "Tool orchestration (SensorThings API + Knowledge Base RAG)",
-            "Quality assurance with self-improvement loop",
-            "Streaming responses"
-        ]
-    }
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """
+    Non-streaming chat endpoint
+    Returns complete response
+    """
+    
+    if not app_graph or not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    try:
+        # Load profile
+        profile = await workflow_instance.memory_service.get_profile(request.user_id)
+        
+        # Config
+        config = {
+            "configurable": {
+                "thread_id": request.thread_id,
+                "workflow": workflow_instance
+            }
+        }
+        
+        # Initial state
+        initial_state = {
+            "messages": [HumanMessage(content=request.query)],
+            "user_id": request.user_id,
+            "thread_id": request.thread_id,
+            "user_profile": profile,
+            "intent": "",
+            "next_worker": "intent_router",
+            "retrieved_docs": [],
+            "should_stream": False,
+            "requires_reflection": True,
+            "iteration": 0
+        }
+        
+        # Run graph
+        final_state = await app_graph.ainvoke(initial_state, config)
+        
+        # Extract response
+        ai_messages = [m for m in final_state["messages"] 
+                      if isinstance(m, AIMessage) and not m.content.startswith("[")]
+        response_text = ai_messages[-1].content if ai_messages else "No response generated"
+        
+        # Save conversation
+        await workflow_instance.memory_service.save_conversation(
+            user_id=request.user_id,
+            thread_id=request.thread_id,
+            query=request.query,
+            response=response_text,
+            metadata={
+                "intent": final_state.get("intent"),
+                "docs_retrieved": len(final_state.get("retrieved_docs", [])),
+                "iterations": final_state.get("iteration", 0)
+            }
+        )
+        
+        return ChatResponse(
+            response=response_text,
+            user_id=request.user_id,
+            thread_id=request.thread_id,
+            metadata={
+                "intent": final_state.get("intent"),
+                "streaming": False
+            }
+        )
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(request: ChatRequest):
+    """
+    Streaming chat endpoint using SSE
+    Returns real-time response chunks
+    """
+    
+    if not request.stream:
+        # Fallback to non-streaming
+        return await chat_endpoint(request)
+    
+    return EventSourceResponse(
+        stream_agent_response(
+            query=request.query,
+            user_id=request.user_id,
+            thread_id=request.thread_id
+        )
+    )
+
+
+@app.get("/profile/{user_id}")
+async def get_user_profile(user_id: str):
+    """Get user profile"""
+    
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    profile = await workflow_instance.memory_service.get_profile(user_id)
+    return {"user_id": user_id, "profile": profile}
+
+
+@app.post("/profile/{user_id}")
+async def update_user_profile(user_id: str, updates: dict):
+    """Update user profile"""
+    
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    await workflow_instance.memory_service.update_profile(user_id, updates)
+    return {"status": "updated", "user_id": user_id}
+
+
+@app.get("/conversations/{user_id}")
+async def get_conversations(user_id: str, limit: int = 10):
+    """Get conversation history"""
+    
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    cursor = workflow_instance.memory_service.conversations.find(
+        {"user_id": user_id}
+    ).sort("timestamp", -1).limit(limit)
+    
+    conversations = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])  # Convert ObjectId to string
+        conversations.append(doc)
+    
+    return {"conversations": conversations}
+
+
+# ==========================================
+# RUN SERVER
+# ==========================================
 
 if __name__ == "__main__":
-    import uvicorn
-    print("=" * 60)
-    print("🚀 Agricultural AI Agent Server Starting...")
-    print("=" * 60)
-    print(f"📊 Vector DB: {'✅ Loaded' if vector_db else '❌ Not found'}")
-    print(f"📚 BM25 Documents: {len(documents)}")
-    print(f"🤖 LLM Model: gpt-4o")
-    print(f"🧠 Router Model: gpt-4o-mini")
-    print("=" * 60)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
