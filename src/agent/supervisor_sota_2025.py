@@ -190,11 +190,13 @@ CRITICAL RULES:
 
 Return JSON."""
     
+    
+    recent_messages = state["messages"][-5:]
     router = wf.llm_fast.with_structured_output(IntentResult)
     result = await router.ainvoke([
         SystemMessage(content=system_prompt),
-        HumanMessage(content=query)
-    ])
+        # HumanMessage(content=query)
+    ] + recent_messages)
     
     print(f"🔍 Intent: {result.intent} ({result.confidence:.0%}) - {result.reasoning}")
     
@@ -310,9 +312,14 @@ async def executor_node(state: AgentState, config: RunnableConfig):
         
         if result and isinstance(result, dict):
             sensor_summary = json.dumps(result, ensure_ascii=False, indent=2)
-            tool_msg = ToolMessage(
-                content=f"[SENSOR DATA]\n{sensor_summary}",
-                tool_call_id="sensor_tool"
+            # tool_msg = ToolMessage(
+            #     content=f"[SENSOR DATA]\n{sensor_summary}",
+            #     tool_call_id="sensor_tool"
+            # )
+            # 🔥 FIX: Dùng HumanMessage thay vì ToolMessage
+            tool_msg = HumanMessage(
+                content=f"📋 [SYSTEM - SENSOR DATA]:\n{sensor_summary}",
+                name="sensor_tool" # name giúp LLM phân biệt nguồn
             )
             print(f"✅ Sensors: {len(result)} readings retrieved")
             
@@ -327,12 +334,18 @@ async def executor_node(state: AgentState, config: RunnableConfig):
                 }]
             }
         else:
+            # return {
+            #     "messages": [ToolMessage(
+            #         content="[SENSOR DATA] No sensor data available",
+            #         tool_call_id="sensor_tool"
+            #     )],
+            #     "current_step": current_step + 1,
+            #     "next_worker": "executor_node"
+            # }
+            # 🔥 FIX: Dùng HumanMessage
             print("⚠️ Sensors: No data")
             return {
-                "messages": [ToolMessage(
-                    content="[SENSOR DATA] No sensor data available",
-                    tool_call_id="sensor_tool"
-                )],
+                "messages": [HumanMessage(content="📋 [SYSTEM - SENSOR]: No data available")],
                 "current_step": current_step + 1,
                 "next_worker": "executor_node"
             }
@@ -355,9 +368,15 @@ async def executor_node(state: AgentState, config: RunnableConfig):
         result = await wf.kb_tool.ainvoke(enhanced_query)
         
         if result and len(result.strip()) > 10:
-            tool_msg = ToolMessage(
-                content=f"[KNOWLEDGE BASE]\n{result}",
-                tool_call_id="kb_tool"
+            # tool_msg = ToolMessage(
+            #     content=f"[KNOWLEDGE BASE]\n{result}",
+            #     tool_call_id="kb_tool"
+            # )
+
+            # 🔥 FIX: Dùng HumanMessage thay vì ToolMessage
+            tool_msg = HumanMessage(
+                content=f"📚 [SYSTEM - KNOWLEDGE BASE]:\n{result}",
+                name="kb_tool"
             )
             print(f"✅ KB: {len(result)} chars retrieved")
             
@@ -373,11 +392,17 @@ async def executor_node(state: AgentState, config: RunnableConfig):
             }
         else:
             print("⚠️ KB: No results")
+            # return {
+            #     "messages": [ToolMessage(
+            #         content="[KNOWLEDGE BASE] No relevant information found",
+            #         tool_call_id="kb_tool"
+            #     )],
+            #     "current_step": current_step + 1,
+            #     "next_worker": "executor_node"
+            # }
+            # 🔥 FIX: Dùng HumanMessage
             return {
-                "messages": [ToolMessage(
-                    content="[KNOWLEDGE BASE] No relevant information found",
-                    tool_call_id="kb_tool"
-                )],
+                "messages": [HumanMessage(content="📚 [SYSTEM - KB]: No relevant info found")],
                 "current_step": current_step + 1,
                 "next_worker": "executor_node"
             }
@@ -389,24 +414,18 @@ async def executor_node(state: AgentState, config: RunnableConfig):
 
 async def small_talk_worker(state: AgentState, config: RunnableConfig):
     wf = config["configurable"]["workflow"]
-    query = state["messages"][-1].content
+    # Không cần lấy query riêng lẻ để tạo HumanMessage nữa vì nó đã nằm trong state["messages"]
     profile = state["user_profile"]
-    
     name = profile.get("name", "bạn")
     
     system_prompt = f"""You are a friendly agricultural assistant chatting with {name}.
-
-Keep responses:
-- Warm and encouraging
-- Brief (2-3 sentences)
-- Subtly mention what you can help with (sensors, farming advice)
-
-Use emojis naturally 🌾🚜"""
+    Keep responses warm, brief and helpful. Use emojis naturally 🌾🚜"""
     
-    response = await wf.llm_fast.ainvoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=query)
-    ])
+    # ✅ FIX: Ghép System Message với toàn bộ lịch sử chat hiện có
+    # state["messages"] đã chứa cả câu hỏi mới nhất của user
+    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    
+    response = await wf.llm_fast.ainvoke(messages)
     
     return {
         "messages": [response],
@@ -428,9 +447,14 @@ async def retrieval_worker(state: AgentState, config: RunnableConfig):
     result = await wf.kb_tool.ainvoke(query)
     
     if result and len(result.strip()) > 10:
-        tool_msg = ToolMessage(
-            content=f"[KNOWLEDGE BASE]\n{result}",
-            tool_call_id="kb_tool"
+        # tool_msg = ToolMessage(
+        #     content=f"[KNOWLEDGE BASE]\n{result}",
+        #     tool_call_id="kb_tool"
+        # )
+        # 🔥 FIX: Dùng HumanMessage
+        tool_msg = HumanMessage(
+            content=f"📚 [SYSTEM - KNOWLEDGE BASE]:\n{result}",
+            name="kb_tool"
         )
         print(f"✅ KB: {len(result)} chars")
         
@@ -444,11 +468,16 @@ async def retrieval_worker(state: AgentState, config: RunnableConfig):
             "next_worker": "synthesis_worker"
         }
     else:
+        # return {
+        #     "messages": [ToolMessage(
+        #         content="No relevant information found",
+        #         tool_call_id="kb_tool"
+        #     )],
+        #     "next_worker": "synthesis_worker"
+        # }
+        # 🔥 FIX: Dùng HumanMessage
         return {
-            "messages": [ToolMessage(
-                content="No relevant information found",
-                tool_call_id="kb_tool"
-            )],
+            "messages": [HumanMessage(content="📚 [SYSTEM]: No info found in KB")],
             "next_worker": "synthesis_worker"
         }
 
@@ -463,26 +492,48 @@ async def synthesis_worker(state: AgentState, config: RunnableConfig):
     profile = state["user_profile"]
     
     # Extract tool results
-    tool_messages = [m for m in state["messages"] if isinstance(m, ToolMessage)]
+    # tool_messages = [m for m in state["messages"] if isinstance(m, ToolMessage)]
     
-    if not tool_messages:
+    # if not tool_messages:
+    #     no_data_msg = AIMessage(content=(
+    #         "Xin lỗi, tôi không tìm thấy thông tin về câu hỏi này. "
+    #         "Hãy hỏi về kỹ thuật canh tác, dữ liệu cảm biến, hoặc vấn đề cây trồng nhé! 🌱"
+    #     ))
+    #     return {
+    #         "messages": [no_data_msg],
+    #         "next_worker": "END"
+    #     }
+    
+    # # Build context
+    # context_parts = []
+    # has_sensor = state.get("sensor_data") is not None
+    # has_kb = state.get("kb_context") is not None
+    
+    # for tm in tool_messages:
+    #     context_parts.append(tm.content)
+    # context = "\n\n".join(context_parts)
+    # 🔥 FIX: DỰA VÀO TRẠNG THÁI (sensor_data, kb_context) thay vì Message Role
+    context_parts = []
+    has_sensor = state.get("sensor_data") is not None
+    has_kb = state.get("kb_context") is not None
+
+    if has_sensor:
+        sensor_summary = json.dumps(state["sensor_data"], ensure_ascii=False, indent=2)
+        context_parts.append(f"📋 **SENSOR DATA AVAILABLE:**\n{sensor_summary}")
+
+    if has_kb:
+        context_parts.append(f"📚 **KNOWLEDGE BASE CONTEXT:**\n{state['kb_context']}")
+        
+    context = "\n\n".join(context_parts)
+
+    if not context:
         no_data_msg = AIMessage(content=(
-            "Xin lỗi, tôi không tìm thấy thông tin về câu hỏi này. "
-            "Hãy hỏi về kỹ thuật canh tác, dữ liệu cảm biến, hoặc vấn đề cây trồng nhé! 🌱"
+            "Xin lỗi, tôi không tìm thấy dữ liệu hoặc thông tin liên quan đến câu hỏi này. 🌱"
         ))
         return {
             "messages": [no_data_msg],
             "next_worker": "END"
         }
-    
-    # Build context
-    context_parts = []
-    has_sensor = state.get("sensor_data") is not None
-    has_kb = state.get("kb_context") is not None
-    
-    for tm in tool_messages:
-        context_parts.append(tm.content)
-    context = "\n\n".join(context_parts)
     
     # Adjusted prompt based on data type
     if has_sensor and has_kb:
@@ -532,16 +583,41 @@ CONTEXT FROM TOOLS:
 {context}
 """
     
+    messages_to_send = [SystemMessage(content=system_prompt)]
+    # for m in state["messages"]:
+    #     if isinstance(m, ToolMessage):
+    #         # ✅ FIX: Chuyển ToolMessage thành HumanMessage để AI hiểu đây là dữ liệu đầu vào
+    #         # mà không yêu cầu phải có tool_call_id khớp lệnh.
+    #         clean_content = f"📋 [DATA RETRIEVED FROM SYSTEM]:\n{m.content}"
+    #         messages_to_send.append(HumanMessage(content=clean_content))
+    #     elif isinstance(m, AIMessage) and m.tool_calls:
+    #         # Nếu có AIMessage cũ chứa tool_calls (nếu có), cũng nên xóa tool_calls đi
+    #         # để tránh AI đợi ToolMessage phản hồi.
+    #         messages_to_send.append(AIMessage(content=m.content))
+    #     else:
+    #         messages_to_send.append(m)
+    # 🔥 FIX: Vòng lặp chỉ giữ lại tin nhắn giao tiếp Human/AI
+    for m in state["messages"]:
+        if isinstance(m, HumanMessage) or isinstance(m, AIMessage):
+            # Loại bỏ các tin nhắn chèn dữ liệu (đã ở trong System Prompt)
+            # và các tin nhắn Plan/Intent meta
+            if m.content and not (m.content.startswith("📋 [SYSTEM - SENSOR DATA]") or m.content.startswith("📚 [SYSTEM - KNOWLEDGE BASE]") or m.content.startswith("[")):
+                 # Đảm bảo chỉ gửi nội dung, không gửi tool_calls cũ
+                messages_to_send.append(m.__class__(content=m.content))
+
+                
+    # Log kiểm tra
+    # print(f"📤 Sending {len(messages_to_send)} messages to LLM")
+
     # Stream response
     response_chunks = []
-    async for chunk in wf.llm_smart.astream([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"Question: {query}")
-    ]):
+    # Sử dụng danh sách tin nhắn đã làm sạch
+    async for chunk in wf.llm_smart.astream(messages_to_send): 
         if chunk.content:
             response_chunks.append(chunk.content)
     
     full_response = "".join(response_chunks)
+
     print(f"\n💬 Response: {full_response[:100]}...")
     
     # Self-Reflection
