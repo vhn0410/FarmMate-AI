@@ -90,7 +90,6 @@ class IntentResult(BaseModel):
 
 
 class ExecutionPlan(BaseModel):
-    """🔥 NEW: Explicit execution plan"""
     steps: List[Literal["sensor_tool", "kb_tool"]]
     reasoning: str
     sensor_query: Optional[str] = None
@@ -235,7 +234,7 @@ async def planner_node(state: AgentState, config: RunnableConfig):
 GOAL: Create a step-by-step plan to answer the user's Vietnamese query.
 
 AVAILABLE TOOLS:
-1. "sensor_tool": Get real-time data (Temp, Humidity, NPK, pH, Light).
+1. "sensor_tool": Get real-time data (Temp, Humidity, NPK, pH, EC).
 2. "kb_tool": Search farming manuals, disease databases, pest control guidelines.
 
 LOGIC (Chain of Thought):
