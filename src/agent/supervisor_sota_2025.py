@@ -171,42 +171,44 @@ async def intent_router_node(state: AgentState, config: RunnableConfig):
     query = state["messages"][-1].content
     profile = state["user_profile"]
     
-    system_prompt = f"""You are an intent classifier for agricultural AI assistant.
+    # SOTA Prompt: Role Definition + Explicit Constraints + Few-Shot Examples (Vietnamese)
+    system_prompt = f"""You are an Intent Classifier for a Vietnamese Agricultural AI.
 
-USER PROFILE:
+USER CONTEXT:
 - Name: {profile.get('name', 'Unknown')}
 - Crops: {', '.join(profile.get('crop_types', ['Not specified']))}
 
-CLASSIFY INTO:
-1. **small_talk**: Greetings, thanks.
-2. **knowledge**: General farming advice (e.g., "How to plant rice?").
-3. **sensor**: User ONLY wants raw numbers (e.g., "What is the temp?", "Show me logs").
-4. **consultation**: User wants ANALYSIS, DIAGNOSIS, or CHECK STATUS (e.g., "Is my soil good?", "Check nutrition", "Plant is yellow").
+CLASSIFICATION RULES:
+1. **small_talk**: Social interactions, greetings, thanks.
+   - Examples: "Chào bạn", "Cảm ơn nhé", "Bạn tên gì?"
+2. **knowledge**: General farming theory/techniques. NO real-time data needed.
+   - Examples: "Cách trồng lúa", "Bệnh đạo ôn là gì?", "Quy trình bón phân cho xoài"
+3. **sensor**: User asks for SPECIFIC numbers/logs only.
+   - Examples: "Nhiệt độ hiện tại bao nhiêu?", "Cho xem log độ ẩm hôm qua", "Đất có chua không?" (Needs pH value)
+4. **consultation**: COMPLEX requests requiring Analysis, Diagnosis, or Recommendations based on CURRENT status.
+   - Examples: "Cây của tôi bị vàng lá, phải làm sao?", "Kiểm tra xem dinh dưỡng đất có ổn cho cây sầu riêng không?", "Phân tích tình trạng vườn".
 
-CRITICAL RULES:
-- "kiểm tra đất/dinh dưỡng" (Check soil/nutrition) → "consultation" (Because we need to Analyze if the data is good/bad using KB).
-- "nhiệt độ bao nhiêu" (What is temp) → "sensor" (Just give the number).
-- "cây bị bệnh gì" (What disease) → "consultation" (Sensor + KB).
+CRITICAL LOGIC (Chain of Thought):
+- If user mentions "bệnh" (disease) or "kiểm tra" (check) -> likely 'consultation' because we need sensor data + KB diagnosis.
+- If user asks purely about "lý thuyết" (theory) -> 'knowledge'.
 
-Return JSON."""
-    
+Output JSON."""
     
     recent_messages = state["messages"][-5:]
     router = wf.llm_fast.with_structured_output(IntentResult)
     result = await router.ainvoke([
         SystemMessage(content=system_prompt),
-        # HumanMessage(content=query)
     ] + recent_messages)
     
     print(f"🔍 Intent: {result.intent} ({result.confidence:.0%}) - {result.reasoning}")
     
-    # Route based on intent
+    # Route logic giữ nguyên
     if result.intent == "small_talk":
         next_worker = "small_talk_worker"
     elif result.intent in ["sensor", "consultation"]:
-        next_worker = "planner_node"  # 🔥 NEW: Plan execution
-    else:  # knowledge
-        next_worker = "retrieval_worker"  # Direct KB retrieval
+        next_worker = "planner_node"
+    else:
+        next_worker = "retrieval_worker"
     
     return {
         "intent": result.intent,
@@ -227,30 +229,30 @@ async def planner_node(state: AgentState, config: RunnableConfig):
     query = state["messages"][-1].content
     intent = state["intent"]
     
-    system_prompt = f"""You are an execution planner.
+    # SOTA Prompt: Task Decomposition
+    system_prompt = f"""You are an Execution Planner for an Agricultural Agent.
+    
+GOAL: Create a step-by-step plan to answer the user's Vietnamese query.
 
-INTENT: {intent}
-QUERY: {query}
+AVAILABLE TOOLS:
+1. "sensor_tool": Get real-time data (Temp, Humidity, NPK, pH, Light).
+2. "kb_tool": Search farming manuals, disease databases, pest control guidelines.
 
-Create a plan to answer the user.
+LOGIC (Chain of Thought):
+- If Intent is 'consultation' (e.g., "Why is my plant yellow?"):
+  1. I need to know the current environment status (Is it too hot? Soil too acid?) -> Call "sensor_tool".
+  2. Then I need to match those conditions with disease symptoms in the database -> Call "kb_tool".
+  -> Plan: ["sensor_tool", "kb_tool"]
 
-STRATEGY:
-1. If the user asks to "Check", "Analyze", or "Diagnose" (Consultation):
-   - We MUST get current status first -> ["sensor_tool"]
-   - THEN we MUST consult the Knowledge Base to interpret those numbers -> ["kb_tool"]
-   - Plan: ["sensor_tool", "kb_tool"]
+- If Intent is 'sensor' (e.g., "Current pH?"):
+  -> Plan: ["sensor_tool"]
 
-2. If the user just asks for "Current reading" or "Log" (Sensor):
-   - Plan: ["sensor_tool"]
+- If Intent is 'knowledge' (e.g., "How to plant rice?"):
+  -> Plan: ["kb_tool"]
 
-3. If the user asks "How to" or "Theory" (Knowledge):
-   - Plan: ["kb_tool"]
-
-OUTPUT INSTRUCTION:
-- For "Check nutrition/soil":
-  - steps: ["sensor_tool", "kb_tool"]
-  - sensor_query: "Get NPK, pH, moisture levels"
-  - kb_query: "Standard nutrient levels for rice/fruit trees, diagnosis based on sensor data" (The system will inject sensor data automatically).
+INSTRUCTIONS:
+- 'sensor_query': Translate user intent into specific metrics (e.g., "Get temperature, humidity, soil moisture").
+- 'kb_query': Formulate a search query. If sensor data will be available, write a query that utilizes it (e.g., "Diagnosis for yellow leaves with high soil moisture").
 
 Return JSON."""
     
@@ -414,17 +416,20 @@ async def executor_node(state: AgentState, config: RunnableConfig):
 
 async def small_talk_worker(state: AgentState, config: RunnableConfig):
     wf = config["configurable"]["workflow"]
-    # Không cần lấy query riêng lẻ để tạo HumanMessage nữa vì nó đã nằm trong state["messages"]
     profile = state["user_profile"]
     name = profile.get("name", "bạn")
     
-    system_prompt = f"""You are a friendly agricultural assistant chatting with {name}.
-    Keep responses warm, brief and helpful. Use emojis naturally 🌾🚜"""
+    system_prompt = f"""Bạn là trợ lý ảo nông nghiệp vui tính, thân thiện.
+    
+    Người dùng: {name}
+    Nhiệm vụ: Trò chuyện xã giao, chào hỏi.
+    Phong cách: Ngắn gọn, ấm áp, đậm chất miền Tây hoặc nông thôn Việt Nam.
+    Ví dụ: "Chào bác Ba, hôm nay lúa má thế nào rồi ạ? 🌾", "Dạ con nghe nè, bác cần giúp gì hông?"
+    
+    HÃY TRẢ LỜI BẰNG TIẾNG VIỆT."""
     
     # ✅ FIX: Ghép System Message với toàn bộ lịch sử chat hiện có
-    # state["messages"] đã chứa cả câu hỏi mới nhất của user
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
-    
     response = await wf.llm_fast.ainvoke(messages)
     
     return {
@@ -491,38 +496,16 @@ async def synthesis_worker(state: AgentState, config: RunnableConfig):
     query = state["messages"][-1].content
     profile = state["user_profile"]
     
-    # Extract tool results
-    # tool_messages = [m for m in state["messages"] if isinstance(m, ToolMessage)]
-    
-    # if not tool_messages:
-    #     no_data_msg = AIMessage(content=(
-    #         "Xin lỗi, tôi không tìm thấy thông tin về câu hỏi này. "
-    #         "Hãy hỏi về kỹ thuật canh tác, dữ liệu cảm biến, hoặc vấn đề cây trồng nhé! 🌱"
-    #     ))
-    #     return {
-    #         "messages": [no_data_msg],
-    #         "next_worker": "END"
-    #     }
-    
-    # # Build context
-    # context_parts = []
-    # has_sensor = state.get("sensor_data") is not None
-    # has_kb = state.get("kb_context") is not None
-    
-    # for tm in tool_messages:
-    #     context_parts.append(tm.content)
-    # context = "\n\n".join(context_parts)
-    # 🔥 FIX: DỰA VÀO TRẠNG THÁI (sensor_data, kb_context) thay vì Message Role
     context_parts = []
     has_sensor = state.get("sensor_data") is not None
     has_kb = state.get("kb_context") is not None
 
     if has_sensor:
         sensor_summary = json.dumps(state["sensor_data"], ensure_ascii=False, indent=2)
-        context_parts.append(f"📋 **SENSOR DATA AVAILABLE:**\n{sensor_summary}")
+        context_parts.append(f"📋 **DỮ LIỆU CẢM BIẾN (SENSOR DATA):**\n{sensor_summary}")
 
     if has_kb:
-        context_parts.append(f"📚 **KNOWLEDGE BASE CONTEXT:**\n{state['kb_context']}")
+        context_parts.append(f"📚 **KIẾN THỨC NÔNG NGHIỆP (KNOWLEDGE BASE):**\n{state['kb_context']}")
         
     context = "\n\n".join(context_parts)
 
@@ -534,52 +517,41 @@ async def synthesis_worker(state: AgentState, config: RunnableConfig):
             "messages": [no_data_msg],
             "next_worker": "END"
         }
-    
+        
     # Adjusted prompt based on data type
-    if has_sensor and has_kb:
-        instruction = """You have BOTH sensor readings and farming knowledge.
+    current_time = datetime.now().strftime("%H:%M ngày %d/%m/%Y")
+    user_name = profile.get('name', 'bác nông dân')
+    crop_info = ', '.join(profile.get('crop_types', []))
 
-STRUCTURE YOUR RESPONSE:
-1. **Current Status** 🌱 (from sensors)
-   - List key sensor readings
-   
-2. **Analysis** 🔍
-   - Interpret sensor values using knowledge base
-   - Identify issues or patterns
-   
-3. **Recommendations** 🌾
-   - Specific actions based on sensor + knowledge
-   - Use farming best practices from KB
-   
-4. **Next Steps** 📝
-   - Immediate actions
-   - Monitoring plan"""
+    system_prompt = f"""Bạn là một chuyên gia tư vấn nông nghiệp AI (Kỹ sư nông nghiệp) uy tín, thân thiện tại Việt Nam.
     
-    elif has_sensor:
-        instruction = """You have sensor data only.
+THÔNG TIN NGƯỜI DÙNG:
+- Tên: {user_name}
+- Cây trồng: {crop_info}
+- Thời gian hiện tại: {current_time}
 
-STRUCTURE:
-1. Current readings
-2. What they mean
-3. General recommendations"""
-    
-    else:
-        instruction = """You have farming knowledge only.
+NHIỆM VỤ:
+Trả lời câu hỏi của người dùng dựa trên dữ liệu được cung cấp (Context).
 
-Provide clear, actionable advice with specific steps."""
-    
-    system_prompt = f"""You are an expert agricultural consultant helping {profile.get('name', 'farmer')}.
+YÊU CẦU QUAN TRỌNG (CHAIN OF THOUGHT):
+1. **Phân tích dữ liệu:** Xem xét kỹ các chỉ số cảm biến (nếu có). Chỉ số nào bất thường (quá cao/thấp) so với tiêu chuẩn cho cây {crop_info}?
+2. **Kết nối kiến thức:** Dùng thông tin từ Knowledge Base để giải thích nguyên nhân và tìm giải pháp cho các chỉ số bất thường đó.
+3. **Lập luận:** Đưa ra lời khuyên dựa trên logic: Hiện trạng -> Nguyên nhân -> Giải pháp -> Hành động cụ thể.
 
-GUIDELINES:
-1. **ONLY use information from the provided data**
-2. **DO NOT make up information**
-3. **Cite sources** when using sensor readings or specific facts
-4. **Be actionable**: Give specific steps, amounts, timings
-5. **Use emojis** to make it friendly 🌱🔍🌾📝
+ĐỊNH DẠNG TRẢ LỜI (TIẾNG VIỆT 100%):
+- Giọng văn: Thân thiện, chuyên nghiệp, khích lệ (như một người bạn đồng hành nhà nông). Dùng từ ngữ địa phương nếu phù hợp nhưng phải dễ hiểu.
+- Cấu trúc:
+  1. 🌱 **Tình trạng hiện tại:** Tóm tắt ngắn gọn các chỉ số quan trọng (nêu rõ tốt hay xấu).
+  2. 🔍 **Chẩn đoán/Phân tích:** Giải thích tại sao lại như vậy (dựa vào KB).
+  3. 💡 **Khuyến nghị hành động:** Các bước cụ thể người dùng cần làm ngay (bón phân gì, tưới bao nhiêu, thuốc gì...).
+  4. 📝 **Lưu ý:** Cảnh báo hoặc lời dặn dò thêm.
 
-{instruction}
+LƯU Ý: 
+- Nếu thiếu dữ liệu, hãy nói rõ và gợi ý người dùng cung cấp thêm.
+- Sử dụng emoji hợp lý (🌾, 🚜, 💧, ✅, ⚠️).
+- Tuyệt đối không bịa đặt số liệu.
 
-CONTEXT FROM TOOLS:
+CONTEXT TỪ HỆ THỐNG:
 {context}
 """
     
@@ -647,17 +619,19 @@ CONTEXT FROM TOOLS:
 
 
 async def _self_reflect(wf, query: str, response: str, context: str) -> ReflectionResult:
-    reflection_prompt = f"""Evaluate this agricultural AI response:
+    # Prompt này giữ tiếng Anh để model GPT-4o đánh giá logic tốt hơn, 
+    # nhưng thêm tiêu chí về ngôn ngữ.
+    reflection_prompt = f"""Evaluate this Vietnamese agricultural AI response:
 
 QUERY: {query}
 RESPONSE: {response}
 AVAILABLE CONTEXT: {context[:300]}...
 
 CRITERIA:
-1. Accuracy: Only uses provided data? (0-30)
-2. Completeness: Answers the question? (0-30)
-3. Actionability: Gives specific advice? (0-20)
-4. Clarity: Easy to understand? (0-20)
+1. Accuracy: Does it strictly follow the sensor data? (0-30)
+2. Language: Is it natural, fluent Vietnamese suitable for farmers? (0-20)
+3. Actionability: Are the recommendations specific and clear? (0-30)
+4. Safety: Any harmful advice? (0-20)
 
 Return structured evaluation."""
     

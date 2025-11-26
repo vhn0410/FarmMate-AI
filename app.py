@@ -161,33 +161,33 @@ class HealthResponse(BaseModel):
 # ==========================================
 
 async def stream_agent_response(
-    query: str, 
-    user_id: str, 
+    query: str,
+    user_id: str,
     thread_id: str
-) -> AsyncIterator[str]:
+):
     """
-    Stream agent execution step-by-step
-    Yields SSE events
+    New SSE generator — compatible with old frontend.
+    Uses graph.astream_events() exactly like previous version.
     """
-    
+
     if not app_graph or not workflow_instance:
-        yield f"data: {json.dumps({'error': 'Agent not initialized'})}\n\n"
+        yield "data: {\"type\": \"error\", \"message\": \"Agent not initialized\"}\n\n"
         return
-    
+
     try:
         # Load profile
         profile = await workflow_instance.memory_service.get_profile(user_id)
-        
-        # Config
+
+        # Create config with workflow
         config = {
             "configurable": {
                 "thread_id": thread_id,
                 "workflow": workflow_instance
             }
         }
-        
+
         # Initial state
-        initial_state = {
+        state = {
             "messages": [HumanMessage(content=query)],
             "user_id": user_id,
             "thread_id": thread_id,
@@ -199,65 +199,98 @@ async def stream_agent_response(
             "requires_reflection": True,
             "iteration": 0
         }
-        
-        # Stream events
-        yield f"data: {json.dumps({'type': 'start', 'message': 'Processing query...'})}\n\n"
-        
-        # Run graph with streaming
-        last_content = ""
-        async for event in app_graph.astream(initial_state, config):
-            # Extract node name and state
-            for node_name, node_state in event.items():
-                if node_name == "__end__":
-                    continue
-                
-                # Send progress
-                yield f"data: {json.dumps({'type': 'progress', 'node': node_name})}\n\n"
-                
-                # If synthesis worker, stream the response
-                if node_name == "synthesis_worker":
-                    messages = node_state.get("messages", [])
-                    for msg in messages:
-                        if isinstance(msg, AIMessage) and msg.content:
-                            # Send incremental content
-                            new_content = msg.content[len(last_content):]
-                            if new_content:
-                                yield f"data: {json.dumps({'type': 'content', 'chunk': new_content})}\n\n"
-                                last_content = msg.content
-        
-        # Final state
-        final_state = await app_graph.ainvoke(initial_state, config)
-        
-        # Extract final response
-        ai_messages = [m for m in final_state["messages"] 
-                      if isinstance(m, AIMessage) and not m.content.startswith("[")]
-        final_response = ai_messages[-1].content if ai_messages else "No response"
-        
+
+        # Announce session start
+        yield 'data: {"type": "start", "message": "Processing query..."}\n\n'
+
+        # MAIN FIX: use astream_events() instead of astream()
+        events = app_graph.astream_events(
+            state,
+            version="v2",
+            config=config
+        )
+
+        response_started = False
+        response_ended = False
+        full_response = ""
+
+        async for event in events:
+            if response_ended:
+                break
+
+            et = event.get("event")
+            node_name = event.get("metadata", {}).get("langgraph_node", "")
+            data = event.get("data", {})
+
+            INTERNAL_NODES = [
+                "intent_router", 
+                "supervisor", 
+                "planner_node",       # <--- QUAN TRỌNG: Thêm cái này
+                "executor_node",      # <--- Nên thêm cái này
+                "memory_update_worker" # <--- Nên thêm cái này
+            ]
+            
+            if node_name in INTERNAL_NODES:
+                # Bỏ qua, không gửi nội dung suy nghĩ của các node này xuống client
+                continue
+            
+
+            # 1️⃣ Streaming chat output from synthesis worker
+            # if et == "on_chat_model_stream" and node_name in ["synthesis_worker", "small_talk_worker"]:
+            if et == "on_chat_model_stream":
+                response_started = True
+                chunk = data.get("chunk")
+
+                if chunk:
+                    from src.utils.utils import serialise_ai_message_chunk, safe_json_escape
+                    text = serialise_ai_message_chunk(chunk)
+
+                    if text:
+                        full_response += text
+                        safe = safe_json_escape(text)
+
+                        yield f'data: {{"type":"content","content":"{safe}"}}\n\n'
+
+            # 2️⃣ Finish generation
+            elif et == "on_chat_model_end":
+                if response_started:
+                    response_ended = True
+                    yield "data: {\"type\": \"end\"}\n\n"
+
+            # 3️⃣ Tool logs (optional)
+            elif et == "on_tool_end":
+                tool_name = event.get("name")
+                print(f"[TOOL] Completed: {tool_name}")
+
         # Save conversation
         await workflow_instance.memory_service.save_conversation(
             user_id=user_id,
             thread_id=thread_id,
             query=query,
-            response=final_response,
-            metadata={
-                "intent": final_state.get("intent"),
-                "docs_retrieved": len(final_state.get("retrieved_docs", [])),
-                "iterations": final_state.get("iteration", 0)
-            }
+            response=full_response,
+            metadata={"length": len(full_response)}
         )
-        
-        # Send completion
-        yield f"data: {json.dumps({'type': 'done', 'response': final_response})}\n\n"
-    
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        msg = str(e).replace('"', '\\"')
+        yield f'data: {{"type":"error","message":"{msg}"}}\n\n'
 
 
 # ==========================================
 # ENDPOINTS
 # ==========================================
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # hoặc domain FE của bạn
+    allow_credentials=True,
+    allow_methods=["*"],   # QUAN TRỌNG: Cho phép OPTIONS
+    allow_headers=["*"],
+)
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -346,25 +379,22 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/chat/stream")
+@app.post("/chat/stream") 
 async def chat_stream_endpoint(request: ChatRequest):
     """
-    Streaming chat endpoint using SSE
-    Returns real-time response chunks
+    Streaming chat endpoint
     """
-    
     if not request.stream:
-        # Fallback to non-streaming
         return await chat_endpoint(request)
     
-    return EventSourceResponse(
+    return StreamingResponse(
         stream_agent_response(
             query=request.query,
             user_id=request.user_id,
             thread_id=request.thread_id
-        )
+        ),
+        media_type="text/event-stream" 
     )
-
 
 @app.get("/profile/{user_id}")
 async def get_user_profile(user_id: str):
