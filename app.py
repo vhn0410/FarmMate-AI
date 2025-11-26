@@ -28,7 +28,10 @@ from src.agent.supervisor_sota_2025 import (
     Workflow,
     AgentState
 )
+from uuid import uuid4
+from typing import List
 
+from datetime import datetime
 # Import retriever
 try:
     from src.implements.embedding import DocumentEmbedding
@@ -225,18 +228,16 @@ async def stream_agent_response(
             INTERNAL_NODES = [
                 "intent_router", 
                 "supervisor", 
-                "planner_node",       # <--- QUAN TRỌNG: Thêm cái này
-                "executor_node",      # <--- Nên thêm cái này
-                "memory_update_worker" # <--- Nên thêm cái này
+                "planner_node",      
+                "executor_node",      
+                "memory_update_worker" 
             ]
             
             if node_name in INTERNAL_NODES:
-                # Bỏ qua, không gửi nội dung suy nghĩ của các node này xuống client
                 continue
             
 
-            # 1️⃣ Streaming chat output from synthesis worker
-            # if et == "on_chat_model_stream" and node_name in ["synthesis_worker", "small_talk_worker"]:
+            # Streaming chat output from synthesis worker
             if et == "on_chat_model_stream":
                 response_started = True
                 chunk = data.get("chunk")
@@ -251,17 +252,29 @@ async def stream_agent_response(
 
                         yield f'data: {{"type":"content","content":"{safe}"}}\n\n'
 
-            # 2️⃣ Finish generation
+            # Finish generation
             elif et == "on_chat_model_end":
                 if response_started:
                     response_ended = True
                     yield "data: {\"type\": \"end\"}\n\n"
 
-            # 3️⃣ Tool logs (optional)
+            # Tool logs (optional)
             elif et == "on_tool_end":
                 tool_name = event.get("name")
                 print(f"[TOOL] Completed: {tool_name}")
 
+        # Save conversation
+        await workflow_instance.memory_service.db["threads"].update_one(
+            {"thread_id": thread_id, "user_id": user_id},
+            {
+                "$set": {
+                    "updated_at": datetime.now().isoformat(),
+                    "last_message": query[:100]
+                },
+                "$inc": {"message_count": 2}  # +1 user, +1 AI
+            },
+            upsert=True  # Tạo thread nếu chưa tồn tại
+        )
         # Save conversation
         await workflow_instance.memory_service.save_conversation(
             user_id=user_id,
@@ -290,6 +303,169 @@ app.add_middleware(
     allow_methods=["*"],   # QUAN TRỌNG: Cho phép OPTIONS
     allow_headers=["*"],
 )
+# ==========================================
+# PYDANTIC MODELS CHO THREADS
+# ==========================================
+
+class ThreadCreate(BaseModel):
+    user_id: str = Field(..., description="User ID from Keycloak")
+    title: str = Field(default="Cuộc hội thoại mới", description="Thread title")
+
+class ThreadResponse(BaseModel):
+    thread_id: str
+    user_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int = 0
+    last_message: Optional[str] = None
+
+class ThreadUpdate(BaseModel):
+    title: Optional[str] = None
+
+# ==========================================
+# THREAD ENDPOINTS
+# ==========================================
+
+@app.post("/threads", response_model=ThreadResponse)
+async def create_thread(request: ThreadCreate):
+    """
+    Tạo thread mới với UUID
+    """
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    thread_id = str(uuid4())
+    now = datetime.now().isoformat()
+    
+    thread_doc = {
+        "thread_id": thread_id,
+        "user_id": request.user_id,
+        "title": request.title,
+        "created_at": now,
+        "updated_at": now,
+        "message_count": 0,
+        "last_message": None
+    }
+    
+    await workflow_instance.memory_service.db["threads"].insert_one(thread_doc)
+    
+    return ThreadResponse(**thread_doc)
+
+
+@app.get("/threads", response_model=List[ThreadResponse])
+async def get_user_threads(user_id: str, limit: int = 50):
+    """
+    Lấy danh sách threads của user (sắp xếp theo updated_at giảm dần)
+    """
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    cursor = workflow_instance.memory_service.db["threads"].find(
+        {"user_id": user_id}
+    ).sort("updated_at", -1).limit(limit)
+    
+    threads = []
+    async for doc in cursor:
+        doc.pop("_id", None)
+        threads.append(ThreadResponse(**doc))
+    
+    return threads
+
+@app.get("/threads/{thread_id}", response_model=ThreadResponse)
+async def get_thread(thread_id: str, user_id: str):
+    """
+    Lấy thông tin 1 thread
+    """
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    thread = await workflow_instance.memory_service.db["threads"].find_one({
+        "thread_id": thread_id,
+        "user_id": user_id
+    })
+    
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    
+    thread.pop("_id", None)
+    return ThreadResponse(**thread)
+
+
+
+@app.patch("/threads/{thread_id}")
+async def update_thread(thread_id: str, user_id: str, updates: ThreadUpdate):
+    """
+    Cập nhật thread (ví dụ: đổi title)
+    """
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    update_data = {k: v for k, v in updates.model_dump().items() if v is not None}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No updates provided")
+    
+    update_data["updated_at"] = datetime.now().isoformat()
+    
+    result = await workflow_instance.memory_service.db["threads"].update_one(
+        {"thread_id": thread_id, "user_id": user_id},
+        {"$set": update_data}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    
+    return {"status": "updated", "thread_id": thread_id}
+
+
+@app.delete("/threads/{thread_id}")
+async def delete_thread(thread_id: str, user_id: str):
+    """
+    Xóa thread và toàn bộ conversations liên quan
+    """
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    # Xóa thread
+    result = await workflow_instance.memory_service.db["threads"].delete_one({
+        "thread_id": thread_id,
+        "user_id": user_id
+    })
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    
+    # Xóa conversations
+    await workflow_instance.memory_service.conversations.delete_many({
+        "thread_id": thread_id,
+        "user_id": user_id
+    })
+    
+    return {"status": "deleted", "thread_id": thread_id}
+
+@app.get("/threads/{thread_id}/messages")
+async def get_thread_messages(thread_id: str, user_id: str, limit: int = 100):
+    """
+    Lấy tin nhắn của 1 thread
+    """
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    cursor = workflow_instance.memory_service.conversations.find(
+        {"thread_id": thread_id, "user_id": user_id}
+    ).sort("timestamp", 1).limit(limit)
+    
+    messages = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        messages.append(doc)
+    
+    return {"thread_id": thread_id, "messages": messages}
+
+
+# ==========================================
+# CẬP NHẬT THREAD KHI CÓ TIN NHẮN MỚI
+# ==========================================
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -435,6 +611,7 @@ async def get_conversations(user_id: str, limit: int = 10):
         conversations.append(doc)
     
     return {"conversations": conversations}
+
 
 
 # ==========================================
