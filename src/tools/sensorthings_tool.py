@@ -1,12 +1,15 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from langchain_core.tools import tool
 import os, requests, json, itertools
+
 # --------------------------
 # Configuration
 # --------------------------
 SENSORTHINGS_BASE = os.getenv("SENSORTHINGS_BASE", "http://localhost:8026")
 OBS_SERVICE = os.getenv("OBS_SERVICE", "http://localhost:8089/ctu/geo/observations/dataStreamIds/latest")
-SENSOR_USER_ID = os.getenv("SENSOR_USER_ID", "a2ecd084-3013-4a15-836c-9c0b7be0b320")
+
+# ⚠️ REMOVED: Hard-coded SENSOR_USER_ID
+# SENSOR_USER_ID = os.getenv("SENSOR_USER_ID", "a2ecd084-3013-4a15-836c-9c0b7be0b320")
 
 
 # --------------------------
@@ -45,69 +48,106 @@ def validate_sensor_values(things: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     continue
     return things
 
+
 # --------------------------
-# Tools
+# 🔥 NEW: Dynamic Tool with User Context
 # --------------------------
-@tool
-def sensorthings_search(query: str) -> Dict[str, Any]:
-    """Return a concise JSON summary of 'things' and their latest observations.
-    The tool will not dump massive raw JSON; it returns a list of devices with: id, name, sensor-count, datastream-summary.
+
+def create_sensorthings_tool(user_id: str):
     """
-    try:
-        url_thing = (
-            f"{SENSORTHINGS_BASE}/get-things?"
-            f"filter=properties/user_id%20eq%20%27{SENSOR_USER_ID}%27"
-            "&expand=sensors($expand=datastreams($expand=observedproperties,measurementunits))"
-        )
-        TOKEN = os.getenv("SENSORTHINGS_TOKEN", "")
-        headers = {"token": TOKEN, "Content-Type": "application/json"}
-        r = requests.get(url_thing, headers=headers, timeout=10)
-        if r.status_code != 200:
-            return {"error": True, "message": f"Things API returned {r.status_code}", "data": None}
-        things = r.json()
-        # flatten
-        things = list(itertools.chain.from_iterable(things))
-        # get datastream ids
-        datastream_ids = []
-        for t in things:
-            for s in t.get("sensors", []):
-                for ds in s.get("datastreams", []):
-                    datastream_ids.append(str(ds.get("id")))
-        # observations
-        obs_payload = json.dumps(datastream_ids)
-        r2 = requests.post(OBS_SERVICE, headers={"accept": "application/json", "Content-Type": "application/json"}, data=obs_payload, timeout=10)
-        if r2.status_code != 200:
-            return {"error": True, "message": f"Observations API returned {r2.status_code}", "data": None}
-        observations = r2.json()
-        obs_map = {item["dataStreamId"]: item for item in observations}
-        for t in things:
-            for s in t.get("sensors", []):
-                for ds in s.get("datastreams", []):
-                    ds_id = str(ds.get("id"))
-                    ds["latest_observation"] = obs_map.get(ds_id)
-        # validate and annotate suspicious values
-        things = validate_sensor_values(things)
-        # build condensed summary to keep LLM tractable
-        summary = []
-        for t in things:
-            t_summary = {"id": t.get("id"), "name": t.get("name"), "sensors": []}
-            for s in t.get("sensors", []):
-                s_summary = {"id": s.get("id"), "name": s.get("name"), "datastreams": []}
-                for ds in s.get("datastreams", []):
-                    ds_summary = {
-                        "id": ds.get("id"),
-                        "name": ds.get("name"),
-                        "observedProperty": ds.get("observedProperty"),
-                        "unit": ds.get("measurementUnit"),
-                        "latest_observation": ds.get("latest_observation") and {
-                            "result": ds.get("latest_observation").get("result"),
-                            "phenomenonTime": ds.get("latest_observation").get("phenomenonTime"),
-                            "_validator": ds.get("latest_observation", {}).get("_validator")
+    Factory function to create a sensor tool with user context
+    
+    Args:
+        user_id: Keycloak user ID (sub claim from JWT)
+        
+    Returns:
+        LangChain tool instance bound to this user
+    """
+    
+    @tool
+    def sensorthings_search(query: str) -> Dict[str, Any]:
+        """Return a concise JSON summary of 'things' and their latest observations.
+        The tool will not dump massive raw JSON; it returns a list of devices with: id, name, sensor-count, datastream-summary.
+        """
+        try:
+            # 🔥 Use dynamic user_id from JWT token
+            url_thing = (
+                f"{SENSORTHINGS_BASE}/get-things?"
+                f"filter=properties/user_id%20eq%20%27{user_id}%27"
+                "&expand=sensors($expand=datastreams($expand=observedproperties,measurementunits))"
+            )
+            
+            TOKEN = os.getenv("SENSORTHINGS_TOKEN", "")
+            headers = {"token": TOKEN, "Content-Type": "application/json"}
+            r = requests.get(url_thing, headers=headers, timeout=10)
+            
+            if r.status_code != 200:
+                return {"error": True, "message": f"Things API returned {r.status_code}", "data": None}
+            
+            things = r.json()
+            # flatten
+            things = list(itertools.chain.from_iterable(things))
+            
+            # get datastream ids
+            datastream_ids = []
+            for t in things:
+                for s in t.get("sensors", []):
+                    for ds in s.get("datastreams", []):
+                        datastream_ids.append(str(ds.get("id")))
+            
+            # observations
+            obs_payload = json.dumps(datastream_ids)
+            r2 = requests.post(OBS_SERVICE, headers={"accept": "application/json", "Content-Type": "application/json"}, data=obs_payload, timeout=10)
+            
+            if r2.status_code != 200:
+                return {"error": True, "message": f"Observations API returned {r2.status_code}", "data": None}
+            
+            observations = r2.json()
+            obs_map = {item["dataStreamId"]: item for item in observations}
+            
+            for t in things:
+                for s in t.get("sensors", []):
+                    for ds in s.get("datastreams", []):
+                        ds_id = str(ds.get("id"))
+                        ds["latest_observation"] = obs_map.get(ds_id)
+            
+            # validate and annotate suspicious values
+            things = validate_sensor_values(things)
+            
+            # build condensed summary to keep LLM tractable
+            summary = []
+            for t in things:
+                t_summary = {"id": t.get("id"), "name": t.get("name"), "sensors": []}
+                for s in t.get("sensors", []):
+                    s_summary = {"id": s.get("id"), "name": s.get("name"), "datastreams": []}
+                    for ds in s.get("datastreams", []):
+                        ds_summary = {
+                            "id": ds.get("id"),
+                            "name": ds.get("name"),
+                            "observedProperty": ds.get("observedProperty"),
+                            "unit": ds.get("measurementUnit"),
+                            "latest_observation": ds.get("latest_observation") and {
+                                "result": ds.get("latest_observation").get("result"),
+                                "phenomenonTime": ds.get("latest_observation").get("phenomenonTime"),
+                                "_validator": ds.get("latest_observation", {}).get("_validator")
+                            }
                         }
-                    }
-                    s_summary["datastreams"].append(ds_summary)
-                t_summary["sensors"].append(s_summary)
-            summary.append(t_summary)
-        return {"error": False, "message": "success", "data": summary}
-    except Exception as e:
-        return {"error": True, "message": str(e), "data": None}
+                        s_summary["datastreams"].append(ds_summary)
+                    t_summary["sensors"].append(s_summary)
+                summary.append(t_summary)
+            
+            return {"error": False, "message": "success", "data": summary}
+            
+        except Exception as e:
+            return {"error": True, "message": str(e), "data": None}
+    
+    return sensorthings_search
+
+
+# --------------------------
+# 🔥 LEGACY: Keep for backward compatibility (optional)
+# --------------------------
+# This uses a default/demo user_id if no authentication is available
+sensorthings_search = create_sensorthings_tool(
+    user_id=os.getenv("SENSOR_USER_ID", "a2ecd084-3013-4a15-836c-9c0b7be0b320")
+)

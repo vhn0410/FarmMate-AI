@@ -309,8 +309,21 @@ async def executor_node(state: AgentState, config: RunnableConfig):
     # Execute appropriate tool
     if tool_name == "sensor_tool":
         sensor_query = plan_data.get("sensor_query") or state["messages"][-1].content
-        result = await sensorthings_search.ainvoke(sensor_query)
         
+        
+        # result = await sensorthings_search.ainvoke(sensor_query)
+        
+        user_sensor_tool = config["configurable"].get("user_sensor_tool")
+        
+        if user_sensor_tool:
+            # Use user-specific tool (with dynamic user_id)
+            result = await user_sensor_tool.ainvoke(sensor_query)
+        else:
+            # Fallback to default tool (for backward compatibility)
+            from src.tools.sensorthings_tool import sensorthings_search
+            result = await sensorthings_search.ainvoke(sensor_query)
+            
+
         if result and isinstance(result, dict):
             sensor_summary = json.dumps(result, ensure_ascii=False, indent=2)
             # tool_msg = ToolMessage(
@@ -472,14 +485,6 @@ async def retrieval_worker(state: AgentState, config: RunnableConfig):
             "next_worker": "synthesis_worker"
         }
     else:
-        # return {
-        #     "messages": [ToolMessage(
-        #         content="No relevant information found",
-        #         tool_call_id="kb_tool"
-        #     )],
-        #     "next_worker": "synthesis_worker"
-        # }
-        # 🔥 FIX: Dùng HumanMessage
         return {
             "messages": [HumanMessage(content="📚 [SYSTEM]: No info found in KB")],
             "next_worker": "synthesis_worker"
@@ -555,19 +560,6 @@ CONTEXT TỪ HỆ THỐNG:
 """
     
     messages_to_send = [SystemMessage(content=system_prompt)]
-    # for m in state["messages"]:
-    #     if isinstance(m, ToolMessage):
-    #         # ✅ FIX: Chuyển ToolMessage thành HumanMessage để AI hiểu đây là dữ liệu đầu vào
-    #         # mà không yêu cầu phải có tool_call_id khớp lệnh.
-    #         clean_content = f"📋 [DATA RETRIEVED FROM SYSTEM]:\n{m.content}"
-    #         messages_to_send.append(HumanMessage(content=clean_content))
-    #     elif isinstance(m, AIMessage) and m.tool_calls:
-    #         # Nếu có AIMessage cũ chứa tool_calls (nếu có), cũng nên xóa tool_calls đi
-    #         # để tránh AI đợi ToolMessage phản hồi.
-    #         messages_to_send.append(AIMessage(content=m.content))
-    #     else:
-    #         messages_to_send.append(m)
-    # 🔥 FIX: Vòng lặp chỉ giữ lại tin nhắn giao tiếp Human/AI
     for m in state["messages"]:
         if isinstance(m, HumanMessage) or isinstance(m, AIMessage):
             # Loại bỏ các tin nhắn chèn dữ liệu (đã ở trong System Prompt)

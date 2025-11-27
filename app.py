@@ -1,37 +1,38 @@
 """
 FastAPI Application for Agricultural AI Agent
 Features:
+- ✅ JWT Keycloak Authentication
+- ✅ Dynamic user_id from token
 - ✅ Server-Sent Events (SSE) for streaming
 - ✅ Real-time response chunks
 - ✅ Conversation history
-- ✅ Health checks & monitoring
 """
 
 import os
 import asyncio
-import json
 from contextlib import asynccontextmanager
-from typing import Optional, AsyncIterator
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage
+
+# 🔥 Import authentication
+from src.auth.keycloak_auth import get_current_user, get_optional_user, KeycloakUser
 
 # Import optimized supervisor
 from src.agent.supervisor_sota_2025 import (
     build_graph, 
     Workflow,
-    AgentState
 )
 from uuid import uuid4
 from typing import List
-
 from datetime import datetime
+
 # Import retriever
 try:
     from src.implements.embedding import DocumentEmbedding
@@ -65,7 +66,6 @@ try:
     print("✅ Loaded production retriever")
 
 except ImportError:
-    # Mock retriever for development
     from langchain_community.retrievers import BM25Retriever
     from langchain_core.documents import Document
     
@@ -73,7 +73,6 @@ except ImportError:
         return BM25Retriever.from_documents([
             Document(page_content="Lúa OM18 sinh trưởng 95-100 ngày, bón phân NPK 20-20-15"),
             Document(page_content="pH đất tối ưu cho lúa: 5.5-6.5"),
-            Document(page_content="Bệnh đạo ôn lá: phun thuốc Validacin 3%")
         ])
     
     print("⚠️ Using mock retriever (development mode)")
@@ -98,17 +97,14 @@ async def lifespan(app: FastAPI):
     print("\n🚀 Starting Agricultural AI Agent (SOTA 2025)...")
     print("="*60)
     
-    # Get retriever
     retriever = get_retriever()
     
-    # Init Workflow
     workflow_instance = Workflow(
         retriever=retriever,
         mongo_uri=MONGODB_URI,
         db_name=DB_NAME
     )
     
-    # Build Graph
     app_graph = build_graph(
         mongo_uri=MONGODB_URI,
         db_name=DB_NAME
@@ -116,7 +112,7 @@ async def lifespan(app: FastAPI):
     
     print("✅ Graph compiled successfully")
     print("✅ Memory service connected")
-    print("✅ Tools initialized")
+    print("✅ JWT Authentication enabled")
     print("="*60)
     print("🌾 Ready to assist farmers!\n")
     
@@ -130,9 +126,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FarmMate AI - SOTA 2025",
-    description="Agricultural AI Agent with Supervisor Multi-Agent Architecture",
-    version="2.0.0",
+    description="Agricultural AI Agent with JWT Authentication",
+    version="2.1.0",
     lifespan=lifespan
+)
+
+# CORS
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ==========================================
@@ -141,16 +148,8 @@ app = FastAPI(
 
 class ChatRequest(BaseModel):
     query: str = Field(..., description="User's question")
-    user_id: str = Field(..., description="Unique user identifier")
     thread_id: str = Field(default="default", description="Conversation thread ID")
     stream: bool = Field(default=True, description="Enable streaming response")
-
-
-class ChatResponse(BaseModel):
-    response: str
-    user_id: str
-    thread_id: str
-    metadata: dict = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
@@ -160,7 +159,7 @@ class HealthResponse(BaseModel):
 
 
 # ==========================================
-# STREAMING HELPER
+# STREAMING HELPER with JWT
 # ==========================================
 
 async def stream_agent_response(
@@ -168,11 +167,7 @@ async def stream_agent_response(
     user_id: str,
     thread_id: str
 ):
-    """
-    New SSE generator — compatible with old frontend.
-    Uses graph.astream_events() exactly like previous version.
-    """
-
+    """Stream agent response with user-specific context"""
     if not app_graph or not workflow_instance:
         yield "data: {\"type\": \"error\", \"message\": \"Agent not initialized\"}\n\n"
         return
@@ -181,11 +176,16 @@ async def stream_agent_response(
         # Load profile
         profile = await workflow_instance.memory_service.get_profile(user_id)
 
-        # Create config with workflow
+        # 🔥 Create user-specific sensor tool
+        from src.tools.sensorthings_tool import create_sensorthings_tool
+        user_sensor_tool = create_sensorthings_tool(user_id)
+
+        # Create config with workflow and user-specific tools
         config = {
             "configurable": {
                 "thread_id": thread_id,
-                "workflow": workflow_instance
+                "workflow": workflow_instance,
+                "user_sensor_tool": user_sensor_tool  # 🔥 Pass user-specific tool
             }
         }
 
@@ -203,10 +203,8 @@ async def stream_agent_response(
             "iteration": 0
         }
 
-        # Announce session start
         yield 'data: {"type": "start", "message": "Processing query..."}\n\n'
 
-        # MAIN FIX: use astream_events() instead of astream()
         events = app_graph.astream_events(
             state,
             version="v2",
@@ -235,9 +233,7 @@ async def stream_agent_response(
             
             if node_name in INTERNAL_NODES:
                 continue
-            
 
-            # Streaming chat output from synthesis worker
             if et == "on_chat_model_stream":
                 response_started = True
                 chunk = data.get("chunk")
@@ -249,19 +245,12 @@ async def stream_agent_response(
                     if text:
                         full_response += text
                         safe = safe_json_escape(text)
-
                         yield f'data: {{"type":"content","content":"{safe}"}}\n\n'
 
-            # Finish generation
             elif et == "on_chat_model_end":
                 if response_started:
                     response_ended = True
                     yield "data: {\"type\": \"end\"}\n\n"
-
-            # Tool logs (optional)
-            elif et == "on_tool_end":
-                tool_name = event.get("name")
-                print(f"[TOOL] Completed: {tool_name}")
 
         # Save conversation
         await workflow_instance.memory_service.db["threads"].update_one(
@@ -271,11 +260,11 @@ async def stream_agent_response(
                     "updated_at": datetime.now().isoformat(),
                     "last_message": query[:100]
                 },
-                "$inc": {"message_count": 2}  # +1 user, +1 AI
+                "$inc": {"message_count": 2}
             },
-            upsert=True  # Tạo thread nếu chưa tồn tại
+            upsert=True
         )
-        # Save conversation
+        
         await workflow_instance.memory_service.save_conversation(
             user_id=user_id,
             thread_id=thread_id,
@@ -294,21 +283,83 @@ async def stream_agent_response(
 # ==========================================
 # ENDPOINTS
 # ==========================================
-from fastapi.middleware.cors import CORSMiddleware
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # hoặc domain FE của bạn
-    allow_credentials=True,
-    allow_methods=["*"],   # QUAN TRỌNG: Cho phép OPTIONS
-    allow_headers=["*"],
-)
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "version": "2.1.0",
+        "components": {
+            "graph": "ready" if app_graph else "not_ready",
+            "workflow": "ready" if workflow_instance else "not_ready",
+            "memory": "connected",
+            "auth": "jwt_enabled"
+        }
+    }
+
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(
+    request: ChatRequest,
+    user: KeycloakUser = Depends(get_current_user)  # 🔥 JWT Authentication Required
+):
+    """
+    Streaming chat endpoint with JWT authentication
+    
+    Requires:
+        - Valid JWT token in Authorization header
+        - Bearer token format
+    """
+    return StreamingResponse(
+        stream_agent_response(
+            query=request.query,
+            user_id=user.sub,  # 🔥 Use user_id from JWT token
+            thread_id=request.thread_id
+        ),
+        media_type="text/event-stream"
+    )
+
+
+@app.get("/profile")
+async def get_user_profile(user: KeycloakUser = Depends(get_current_user)):
+    """Get current user profile from JWT token"""
+    
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    # Get profile from database
+    profile = await workflow_instance.memory_service.get_profile(user.sub)
+    
+    return {
+        "user_id": user.sub,
+        "username": user.preferred_username,
+        "email": user.email,
+        "name": user.name,
+        "roles": user.realm_roles,
+        "profile": profile
+    }
+
+
+@app.post("/profile")
+async def update_user_profile(
+    updates: dict,
+    user: KeycloakUser = Depends(get_current_user)
+):
+    """Update user profile"""
+    
+    if not workflow_instance:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    await workflow_instance.memory_service.update_profile(user.sub, updates)
+    return {"status": "updated", "user_id": user.sub}
+
+
 # ==========================================
-# PYDANTIC MODELS CHO THREADS
+# THREAD ENDPOINTS (with JWT)
 # ==========================================
 
 class ThreadCreate(BaseModel):
-    user_id: str = Field(..., description="User ID from Keycloak")
     title: str = Field(default="Cuộc hội thoại mới", description="Thread title")
 
 class ThreadResponse(BaseModel):
@@ -320,18 +371,13 @@ class ThreadResponse(BaseModel):
     message_count: int = 0
     last_message: Optional[str] = None
 
-class ThreadUpdate(BaseModel):
-    title: Optional[str] = None
-
-# ==========================================
-# THREAD ENDPOINTS
-# ==========================================
 
 @app.post("/threads", response_model=ThreadResponse)
-async def create_thread(request: ThreadCreate):
-    """
-    Tạo thread mới với UUID
-    """
+async def create_thread(
+    request: ThreadCreate,
+    user: KeycloakUser = Depends(get_current_user)  # 🔥 JWT Required
+):
+    """Create thread for authenticated user"""
     if not workflow_instance:
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
@@ -340,7 +386,7 @@ async def create_thread(request: ThreadCreate):
     
     thread_doc = {
         "thread_id": thread_id,
-        "user_id": request.user_id,
+        "user_id": user.sub,  # 🔥 Use JWT user_id
         "title": request.title,
         "created_at": now,
         "updated_at": now,
@@ -354,15 +400,16 @@ async def create_thread(request: ThreadCreate):
 
 
 @app.get("/threads", response_model=List[ThreadResponse])
-async def get_user_threads(user_id: str, limit: int = 50):
-    """
-    Lấy danh sách threads của user (sắp xếp theo updated_at giảm dần)
-    """
+async def get_user_threads(
+    limit: int = 50,
+    user: KeycloakUser = Depends(get_current_user)  # 🔥 JWT Required
+):
+    """Get threads for authenticated user"""
     if not workflow_instance:
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
     cursor = workflow_instance.memory_service.db["threads"].find(
-        {"user_id": user_id}
+        {"user_id": user.sub}  # 🔥 Filter by JWT user_id
     ).sort("updated_at", -1).limit(limit)
     
     threads = []
@@ -372,246 +419,32 @@ async def get_user_threads(user_id: str, limit: int = 50):
     
     return threads
 
-@app.get("/threads/{thread_id}", response_model=ThreadResponse)
-async def get_thread(thread_id: str, user_id: str):
-    """
-    Lấy thông tin 1 thread
-    """
-    if not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    thread = await workflow_instance.memory_service.db["threads"].find_one({
-        "thread_id": thread_id,
-        "user_id": user_id
-    })
-    
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    
-    thread.pop("_id", None)
-    return ThreadResponse(**thread)
-
-
-
-@app.patch("/threads/{thread_id}")
-async def update_thread(thread_id: str, user_id: str, updates: ThreadUpdate):
-    """
-    Cập nhật thread (ví dụ: đổi title)
-    """
-    if not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    update_data = {k: v for k, v in updates.model_dump().items() if v is not None}
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No updates provided")
-    
-    update_data["updated_at"] = datetime.now().isoformat()
-    
-    result = await workflow_instance.memory_service.db["threads"].update_one(
-        {"thread_id": thread_id, "user_id": user_id},
-        {"$set": update_data}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    
-    return {"status": "updated", "thread_id": thread_id}
-
 
 @app.delete("/threads/{thread_id}")
-async def delete_thread(thread_id: str, user_id: str):
-    """
-    Xóa thread và toàn bộ conversations liên quan
-    """
+async def delete_thread(
+    thread_id: str,
+    user: KeycloakUser = Depends(get_current_user)  # 🔥 JWT Required
+):
+    """Delete thread (only if owned by user)"""
     if not workflow_instance:
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
-    # Xóa thread
+    # 🔥 Ensure user can only delete their own threads
     result = await workflow_instance.memory_service.db["threads"].delete_one({
         "thread_id": thread_id,
-        "user_id": user_id
+        "user_id": user.sub  # 🔥 Security check
     })
     
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Thread not found")
+        raise HTTPException(status_code=404, detail="Thread not found or access denied")
     
-    # Xóa conversations
+    # Delete conversations
     await workflow_instance.memory_service.conversations.delete_many({
         "thread_id": thread_id,
-        "user_id": user_id
+        "user_id": user.sub
     })
     
     return {"status": "deleted", "thread_id": thread_id}
-
-@app.get("/threads/{thread_id}/messages")
-async def get_thread_messages(thread_id: str, user_id: str, limit: int = 100):
-    """
-    Lấy tin nhắn của 1 thread
-    """
-    if not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    cursor = workflow_instance.memory_service.conversations.find(
-        {"thread_id": thread_id, "user_id": user_id}
-    ).sort("timestamp", 1).limit(limit)
-    
-    messages = []
-    async for doc in cursor:
-        doc["_id"] = str(doc["_id"])
-        messages.append(doc)
-    
-    return {"thread_id": thread_id, "messages": messages}
-
-
-# ==========================================
-# CẬP NHẬT THREAD KHI CÓ TIN NHẮN MỚI
-# ==========================================
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "version": "2.0.0",
-        "components": {
-            "graph": "ready" if app_graph else "not_ready",
-            "workflow": "ready" if workflow_instance else "not_ready",
-            "memory": "connected"
-        }
-    }
-
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    """
-    Non-streaming chat endpoint
-    Returns complete response
-    """
-    
-    if not app_graph or not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    try:
-        # Load profile
-        profile = await workflow_instance.memory_service.get_profile(request.user_id)
-        
-        # Config
-        config = {
-            "configurable": {
-                "thread_id": request.thread_id,
-                "workflow": workflow_instance
-            }
-        }
-        
-        # Initial state
-        initial_state = {
-            "messages": [HumanMessage(content=request.query)],
-            "user_id": request.user_id,
-            "thread_id": request.thread_id,
-            "user_profile": profile,
-            "intent": "",
-            "next_worker": "intent_router",
-            "retrieved_docs": [],
-            "should_stream": False,
-            "requires_reflection": True,
-            "iteration": 0
-        }
-        
-        # Run graph
-        final_state = await app_graph.ainvoke(initial_state, config)
-        
-        # Extract response
-        ai_messages = [m for m in final_state["messages"] 
-                      if isinstance(m, AIMessage) and not m.content.startswith("[")]
-        response_text = ai_messages[-1].content if ai_messages else "No response generated"
-        
-        # Save conversation
-        await workflow_instance.memory_service.save_conversation(
-            user_id=request.user_id,
-            thread_id=request.thread_id,
-            query=request.query,
-            response=response_text,
-            metadata={
-                "intent": final_state.get("intent"),
-                "docs_retrieved": len(final_state.get("retrieved_docs", [])),
-                "iterations": final_state.get("iteration", 0)
-            }
-        )
-        
-        return ChatResponse(
-            response=response_text,
-            user_id=request.user_id,
-            thread_id=request.thread_id,
-            metadata={
-                "intent": final_state.get("intent"),
-                "streaming": False
-            }
-        )
-    
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/chat/stream") 
-async def chat_stream_endpoint(request: ChatRequest):
-    """
-    Streaming chat endpoint
-    """
-    if not request.stream:
-        return await chat_endpoint(request)
-    
-    return StreamingResponse(
-        stream_agent_response(
-            query=request.query,
-            user_id=request.user_id,
-            thread_id=request.thread_id
-        ),
-        media_type="text/event-stream" 
-    )
-
-@app.get("/profile/{user_id}")
-async def get_user_profile(user_id: str):
-    """Get user profile"""
-    
-    if not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    profile = await workflow_instance.memory_service.get_profile(user_id)
-    return {"user_id": user_id, "profile": profile}
-
-
-@app.post("/profile/{user_id}")
-async def update_user_profile(user_id: str, updates: dict):
-    """Update user profile"""
-    
-    if not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    await workflow_instance.memory_service.update_profile(user_id, updates)
-    return {"status": "updated", "user_id": user_id}
-
-
-@app.get("/conversations/{user_id}")
-async def get_conversations(user_id: str, limit: int = 10):
-    """Get conversation history"""
-    
-    if not workflow_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    cursor = workflow_instance.memory_service.conversations.find(
-        {"user_id": user_id}
-    ).sort("timestamp", -1).limit(limit)
-    
-    conversations = []
-    async for doc in cursor:
-        doc["_id"] = str(doc["_id"])  # Convert ObjectId to string
-        conversations.append(doc)
-    
-    return {"conversations": conversations}
-
 
 
 # ==========================================
