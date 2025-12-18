@@ -34,6 +34,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from src.tools.knowledge_base_tool import KnowledgeBaseService, build_kb_tool
 from src.tools.sensorthings_tool import sensorthings_search
+from src.utils.utils import load_prompt
 
 load_dotenv()
 
@@ -51,7 +52,7 @@ class AgentState(TypedDict):
     intent: str
     next_worker: str
     
-    # 🔥 NEW: Execution Plan
+    # Execution Plan
     execution_plan: List[str]  # ["sensor_tool", "kb_tool"]
     current_step: int
     
@@ -171,27 +172,29 @@ async def intent_router_node(state: AgentState, config: RunnableConfig):
     profile = state["user_profile"]
     
     # SOTA Prompt: Role Definition + Explicit Constraints + Few-Shot Examples (Vietnamese)
-    system_prompt = f"""You are an Intent Classifier for a Vietnamese Agricultural AI.
+#     system_prompt = f"""You are an Intent Classifier for a Vietnamese Agricultural AI.
 
-USER CONTEXT:
-- Name: {profile.get('name', 'Unknown')}
-- Crops: {', '.join(profile.get('crop_types', ['Not specified']))}
+# USER CONTEXT:
+# - Name: {profile.get('name', 'Unknown')}
+# - Crops: {', '.join(profile.get('crop_types', ['Not specified']))}
 
-CLASSIFICATION RULES:
-1. **small_talk**: Social interactions, greetings, thanks.
-   - Examples: "Chào bạn", "Cảm ơn nhé", "Bạn tên gì?"
-2. **knowledge**: General farming theory/techniques. NO real-time data needed.
-   - Examples: "Cách trồng lúa", "Bệnh đạo ôn là gì?", "Quy trình bón phân cho xoài"
-3. **sensor**: User asks for SPECIFIC numbers/logs only.
-   - Examples: "Nhiệt độ hiện tại bao nhiêu?", "Cho xem log độ ẩm hôm qua", "Đất có chua không?" (Needs pH value)
-4. **consultation**: COMPLEX requests requiring Analysis, Diagnosis, or Recommendations based on CURRENT status.
-   - Examples: "Cây của tôi bị vàng lá, phải làm sao?", "Kiểm tra xem dinh dưỡng đất có ổn cho cây sầu riêng không?", "Phân tích tình trạng vườn".
+# CLASSIFICATION RULES:
+# 1. **small_talk**: Social interactions, greetings, thanks.
+#    - Examples: "Chào bạn", "Cảm ơn nhé", "Bạn tên gì?"
+# 2. **knowledge**: General farming theory/techniques. NO real-time data needed.
+#    - Examples: "Cách trồng lúa", "Bệnh đạo ôn là gì?", "Quy trình bón phân cho xoài"
+# 3. **sensor**: User asks for SPECIFIC numbers/logs only.
+#    - Examples: "Nhiệt độ hiện tại bao nhiêu?", "Cho xem log độ ẩm hôm qua", "Đất có chua không?" (Needs pH value)
+# 4. **consultation**: COMPLEX requests requiring Analysis, Diagnosis, or Recommendations based on CURRENT status.
+#    - Examples: "Cây của tôi bị vàng lá, phải làm sao?", "Kiểm tra xem dinh dưỡng đất có ổn cho cây sầu riêng không?", "Phân tích tình trạng vườn".
 
-CRITICAL LOGIC (Chain of Thought):
-- If user mentions "bệnh" (disease) or "kiểm tra" (check) -> likely 'consultation' because we need sensor data + KB diagnosis.
-- If user asks purely about "lý thuyết" (theory) -> 'knowledge'.
+# CRITICAL LOGIC (Chain of Thought):
+# - If user mentions "bệnh" (disease) or "kiểm tra" (check) -> likely 'consultation' because we need sensor data + KB diagnosis.
+# - If user asks purely about "lý thuyết" (theory) -> 'knowledge'.
 
-Output JSON."""
+# Output JSON."""
+    system_prompt = load_prompt("intent_router_node.md", name=profile.get('name', 'Unknown'), 
+                                crops=', '.join(profile.get('crop_types', ['Not specified'])))
     
     recent_messages = state["messages"][-5:]
     router = wf.llm_fast.with_structured_output(IntentResult)
@@ -220,7 +223,7 @@ Output JSON."""
 
 
 # ==========================================
-# 5. 🔥 NEW: PLANNER NODE
+# 5. PLANNER NODE
 # ==========================================
 
 async def planner_node(state: AgentState, config: RunnableConfig):
@@ -229,32 +232,33 @@ async def planner_node(state: AgentState, config: RunnableConfig):
     intent = state["intent"]
     
     # SOTA Prompt: Task Decomposition
-    system_prompt = f"""You are an Execution Planner for an Agricultural Agent.
+#     system_prompt = f"""You are an Execution Planner for an Agricultural Agent.
     
-GOAL: Create a step-by-step plan to answer the user's Vietnamese query.
+# GOAL: Create a step-by-step plan to answer the user's Vietnamese query.
 
-AVAILABLE TOOLS:
-1. "sensor_tool": Get real-time data (Temp, Humidity, NPK, pH, EC).
-2. "kb_tool": Search farming manuals, disease databases, pest control guidelines.
+# AVAILABLE TOOLS:
+# 1. "sensor_tool": Get real-time data (Temp, Humidity, NPK, pH, EC).
+# 2. "kb_tool": Search farming manuals, disease databases, pest control guidelines.
 
-LOGIC (Chain of Thought):
-- If Intent is 'consultation' (e.g., "Why is my plant yellow?"):
-  1. I need to know the current environment status (Is it too hot? Soil too acid?) -> Call "sensor_tool".
-  2. Then I need to match those conditions with disease symptoms in the database -> Call "kb_tool".
-  -> Plan: ["sensor_tool", "kb_tool"]
+# LOGIC (Chain of Thought):
+# - If Intent is 'consultation' (e.g., "Why is my plant yellow?"):
+#   1. I need to know the current environment status (Is it too hot? Soil too acid?) -> Call "sensor_tool".
+#   2. Then I need to match those conditions with disease symptoms in the database -> Call "kb_tool".
+#   -> Plan: ["sensor_tool", "kb_tool"]
 
-- If Intent is 'sensor' (e.g., "Current pH?"):
-  -> Plan: ["sensor_tool"]
+# - If Intent is 'sensor' (e.g., "Current pH?"):
+#   -> Plan: ["sensor_tool"]
 
-- If Intent is 'knowledge' (e.g., "How to plant rice?"):
-  -> Plan: ["kb_tool"]
+# - If Intent is 'knowledge' (e.g., "How to plant rice?"):
+#   -> Plan: ["kb_tool"]
 
-INSTRUCTIONS:
-- 'sensor_query': Translate user intent into specific metrics (e.g., "Get temperature, humidity, soil moisture").
-- 'kb_query': Formulate a search query. If sensor data will be available, write a query that utilizes it (e.g., "Diagnosis for yellow leaves with high soil moisture").
+# INSTRUCTIONS:
+# - 'sensor_query': Translate user intent into specific metrics (e.g., "Get temperature, humidity, soil moisture").
+# - 'kb_query': Formulate a search query. If sensor data will be available, write a query that utilizes it (e.g., "Diagnosis for yellow leaves with high soil moisture").
 
-Return JSON."""
-    
+# Return JSON."""
+    system_prompt = load_prompt("planner_node.md")
+
     planner = wf.llm_fast.with_structured_output(ExecutionPlan)
     plan = await planner.ainvoke(system_prompt)
     
@@ -280,7 +284,7 @@ Return JSON."""
 
 
 # ==========================================
-# 6. 🔥 NEW: EXECUTOR NODE (Sequential)
+# 6. EXECUTOR NODE (Sequential)
 # ==========================================
 
 async def executor_node(state: AgentState, config: RunnableConfig):
@@ -313,11 +317,7 @@ async def executor_node(state: AgentState, config: RunnableConfig):
         
         if result and isinstance(result, dict):
             sensor_summary = json.dumps(result, ensure_ascii=False, indent=2)
-            # tool_msg = ToolMessage(
-            #     content=f"[SENSOR DATA]\n{sensor_summary}",
-            #     tool_call_id="sensor_tool"
-            # )
-            # 🔥 FIX: Dùng HumanMessage thay vì ToolMessage
+
             tool_msg = HumanMessage(
                 content=f"📋 [SYSTEM - SENSOR DATA]:\n{sensor_summary}",
                 name="sensor_tool" # name giúp LLM phân biệt nguồn
@@ -335,15 +335,6 @@ async def executor_node(state: AgentState, config: RunnableConfig):
                 }]
             }
         else:
-            # return {
-            #     "messages": [ToolMessage(
-            #         content="[SENSOR DATA] No sensor data available",
-            #         tool_call_id="sensor_tool"
-            #     )],
-            #     "current_step": current_step + 1,
-            #     "next_worker": "executor_node"
-            # }
-            # 🔥 FIX: Dùng HumanMessage
             print("⚠️ Sensors: No data")
             return {
                 "messages": [HumanMessage(content="📋 [SYSTEM - SENSOR]: No data available")],
@@ -352,7 +343,7 @@ async def executor_node(state: AgentState, config: RunnableConfig):
             }
     
     elif tool_name == "kb_tool":
-        # 🔥 CRITICAL: Use sensor context to enhance KB query
+        # Use sensor context to enhance KB query
         kb_query = plan_data.get("kb_query") or state["messages"][-1].content
         
         # Enrich KB query with sensor results
@@ -369,12 +360,8 @@ async def executor_node(state: AgentState, config: RunnableConfig):
         result = await wf.kb_tool.ainvoke(enhanced_query)
         
         if result and len(result.strip()) > 10:
-            # tool_msg = ToolMessage(
-            #     content=f"[KNOWLEDGE BASE]\n{result}",
-            #     tool_call_id="kb_tool"
-            # )
 
-            # 🔥 FIX: Dùng HumanMessage thay vì ToolMessage
+            # Dùng HumanMessage thay vì ToolMessage
             tool_msg = HumanMessage(
                 content=f"📚 [SYSTEM - KNOWLEDGE BASE]:\n{result}",
                 name="kb_tool"
@@ -393,15 +380,7 @@ async def executor_node(state: AgentState, config: RunnableConfig):
             }
         else:
             print("⚠️ KB: No results")
-            # return {
-            #     "messages": [ToolMessage(
-            #         content="[KNOWLEDGE BASE] No relevant information found",
-            #         tool_call_id="kb_tool"
-            #     )],
-            #     "current_step": current_step + 1,
-            #     "next_worker": "executor_node"
-            # }
-            # 🔥 FIX: Dùng HumanMessage
+            # Dùng HumanMessage
             return {
                 "messages": [HumanMessage(content="📚 [SYSTEM - KB]: No relevant info found")],
                 "current_step": current_step + 1,
@@ -418,16 +397,20 @@ async def small_talk_worker(state: AgentState, config: RunnableConfig):
     profile = state["user_profile"]
     name = profile.get("name", "bạn")
     
-    system_prompt = f"""Bạn là trợ lý ảo nông nghiệp vui tính, thân thiện.
+    # system_prompt = f"""Bạn là trợ lý ảo nông nghiệp vui tính, thân thiện.
     
-    Người dùng: {name}
-    Nhiệm vụ: Trò chuyện xã giao, chào hỏi.
-    Phong cách: Ngắn gọn, ấm áp, đậm chất miền Tây hoặc nông thôn Việt Nam.
-    Ví dụ: "Chào bác Ba, hôm nay lúa má thế nào rồi ạ? 🌾", "Dạ con nghe nè, bác cần giúp gì hông?"
+    # Người dùng: {name}
+    # Nhiệm vụ: Trò chuyện xã giao, chào hỏi.
+    # Phong cách: Ngắn gọn, ấm áp, đậm chất miền Tây hoặc nông thôn Việt Nam.
+    # Ví dụ: "Chào bác Ba, hôm nay lúa má thế nào rồi ạ? 🌾", "Dạ con nghe nè, bác cần giúp gì hông?"
     
-    HÃY TRẢ LỜI BẰNG TIẾNG VIỆT."""
-    
-    # ✅ FIX: Ghép System Message với toàn bộ lịch sử chat hiện có
+    # HÃY TRẢ LỜI BẰNG TIẾNG VIỆT."""
+
+
+    system_prompt = load_prompt("small_talk.md", name=name)
+
+
+    # Ghép System Message với toàn bộ lịch sử chat hiện có
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
     response = await wf.llm_fast.ainvoke(messages)
     
@@ -451,11 +434,7 @@ async def retrieval_worker(state: AgentState, config: RunnableConfig):
     result = await wf.kb_tool.ainvoke(query)
     
     if result and len(result.strip()) > 10:
-        # tool_msg = ToolMessage(
-        #     content=f"[KNOWLEDGE BASE]\n{result}",
-        #     tool_call_id="kb_tool"
-        # )
-        # 🔥 FIX: Dùng HumanMessage
+        # Dùng HumanMessage
         tool_msg = HumanMessage(
             content=f"📚 [SYSTEM - KNOWLEDGE BASE]:\n{result}",
             name="kb_tool"
@@ -472,14 +451,7 @@ async def retrieval_worker(state: AgentState, config: RunnableConfig):
             "next_worker": "synthesis_worker"
         }
     else:
-        # return {
-        #     "messages": [ToolMessage(
-        #         content="No relevant information found",
-        #         tool_call_id="kb_tool"
-        #     )],
-        #     "next_worker": "synthesis_worker"
-        # }
-        # 🔥 FIX: Dùng HumanMessage
+        # Dùng HumanMessage
         return {
             "messages": [HumanMessage(content="📚 [SYSTEM]: No info found in KB")],
             "next_worker": "synthesis_worker"
@@ -522,52 +494,43 @@ async def synthesis_worker(state: AgentState, config: RunnableConfig):
     user_name = profile.get('name', 'bác nông dân')
     crop_info = ', '.join(profile.get('crop_types', []))
 
-    system_prompt = f"""Bạn là một chuyên gia tư vấn nông nghiệp AI (Kỹ sư nông nghiệp) uy tín, thân thiện tại Việt Nam.
+#     system_prompt = f"""Bạn là một chuyên gia tư vấn nông nghiệp AI (Kỹ sư nông nghiệp) uy tín, thân thiện tại Việt Nam.
     
-THÔNG TIN NGƯỜI DÙNG:
-- Tên: {user_name}
-- Cây trồng: {crop_info}
-- Thời gian hiện tại: {current_time}
+# THÔNG TIN NGƯỜI DÙNG:
+# - Tên: {user_name}
+# - Cây trồng: {crop_info}
+# - Thời gian hiện tại: {current_time}
 
-NHIỆM VỤ:
-Trả lời câu hỏi của người dùng dựa trên dữ liệu được cung cấp (Context).
+# NHIỆM VỤ:
+# Trả lời câu hỏi của người dùng dựa trên dữ liệu được cung cấp (Context).
 
-YÊU CẦU QUAN TRỌNG (CHAIN OF THOUGHT):
-1. **Phân tích dữ liệu:** Xem xét kỹ các chỉ số cảm biến (nếu có). Chỉ số nào bất thường (quá cao/thấp) so với tiêu chuẩn cho cây {crop_info}?
-2. **Kết nối kiến thức:** Dùng thông tin từ Knowledge Base để giải thích nguyên nhân và tìm giải pháp cho các chỉ số bất thường đó.
-3. **Lập luận:** Đưa ra lời khuyên dựa trên logic: Hiện trạng -> Nguyên nhân -> Giải pháp -> Hành động cụ thể.
+# YÊU CẦU QUAN TRỌNG (CHAIN OF THOUGHT):
+# 1. **Phân tích dữ liệu:** Xem xét kỹ các chỉ số cảm biến (nếu có). Chỉ số nào bất thường (quá cao/thấp) so với tiêu chuẩn cho cây {crop_info}?
+# 2. **Kết nối kiến thức:** Dùng thông tin từ Knowledge Base để giải thích nguyên nhân và tìm giải pháp cho các chỉ số bất thường đó.
+# 3. **Lập luận:** Đưa ra lời khuyên dựa trên logic: Hiện trạng -> Nguyên nhân -> Giải pháp -> Hành động cụ thể.
 
-ĐỊNH DẠNG TRẢ LỜI (TIẾNG VIỆT 100%):
-- Giọng văn: Thân thiện, chuyên nghiệp, khích lệ (như một người bạn đồng hành nhà nông). Dùng từ ngữ địa phương nếu phù hợp nhưng phải dễ hiểu.
-- Cấu trúc:
-  1. 🌱 **Tình trạng hiện tại:** Tóm tắt ngắn gọn các chỉ số quan trọng (nêu rõ tốt hay xấu).
-  2. 🔍 **Chẩn đoán/Phân tích:** Giải thích tại sao lại như vậy (dựa vào KB).
-  3. 💡 **Khuyến nghị hành động:** Các bước cụ thể người dùng cần làm ngay (bón phân gì, tưới bao nhiêu, thuốc gì...).
-  4. 📝 **Lưu ý:** Cảnh báo hoặc lời dặn dò thêm.
+# ĐỊNH DẠNG TRẢ LỜI (TIẾNG VIỆT 100%):
+# - Giọng văn: Thân thiện, chuyên nghiệp, khích lệ (như một người bạn đồng hành nhà nông). Dùng từ ngữ địa phương nếu phù hợp nhưng phải dễ hiểu.
+# - Cấu trúc:
+#   1. 🌱 **Tình trạng hiện tại:** Tóm tắt ngắn gọn các chỉ số quan trọng (nêu rõ tốt hay xấu).
+#   2. 🔍 **Chẩn đoán/Phân tích:** Giải thích tại sao lại như vậy (dựa vào KB).
+#   3. 💡 **Khuyến nghị hành động:** Các bước cụ thể người dùng cần làm ngay (bón phân gì, tưới bao nhiêu, thuốc gì...).
+#   4. 📝 **Lưu ý:** Cảnh báo hoặc lời dặn dò thêm.
 
-LƯU Ý: 
-- Nếu thiếu dữ liệu, hãy nói rõ và gợi ý người dùng cung cấp thêm.
-- Sử dụng emoji hợp lý (🌾, 🚜, 💧, ✅, ⚠️).
-- Tuyệt đối không bịa đặt số liệu.
+# LƯU Ý: 
+# - Nếu thiếu dữ liệu, hãy nói rõ và gợi ý người dùng cung cấp thêm.
+# - Sử dụng emoji hợp lý (🌾, 🚜, 💧, ✅, ⚠️).
+# - Tuyệt đối không bịa đặt số liệu.
 
-CONTEXT TỪ HỆ THỐNG:
-{context}
-"""
-    
+# CONTEXT TỪ HỆ THỐNG:
+# {context}
+# """
+    system_prompt = load_prompt("synthesis_worker.md", user_name=user_name, 
+                                crop_info=crop_info, current_time=current_time, context=context)
+
+
     messages_to_send = [SystemMessage(content=system_prompt)]
-    # for m in state["messages"]:
-    #     if isinstance(m, ToolMessage):
-    #         # ✅ FIX: Chuyển ToolMessage thành HumanMessage để AI hiểu đây là dữ liệu đầu vào
-    #         # mà không yêu cầu phải có tool_call_id khớp lệnh.
-    #         clean_content = f"📋 [DATA RETRIEVED FROM SYSTEM]:\n{m.content}"
-    #         messages_to_send.append(HumanMessage(content=clean_content))
-    #     elif isinstance(m, AIMessage) and m.tool_calls:
-    #         # Nếu có AIMessage cũ chứa tool_calls (nếu có), cũng nên xóa tool_calls đi
-    #         # để tránh AI đợi ToolMessage phản hồi.
-    #         messages_to_send.append(AIMessage(content=m.content))
-    #     else:
-    #         messages_to_send.append(m)
-    # 🔥 FIX: Vòng lặp chỉ giữ lại tin nhắn giao tiếp Human/AI
+   
     for m in state["messages"]:
         if isinstance(m, HumanMessage) or isinstance(m, AIMessage):
             # Loại bỏ các tin nhắn chèn dữ liệu (đã ở trong System Prompt)
@@ -713,8 +676,8 @@ def build_graph(mongo_uri: str, db_name: str = "agricultural_agent"):
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("intent_router", intent_router_node)
     graph.add_node("small_talk_worker", small_talk_worker)
-    graph.add_node("planner_node", planner_node)  # 🔥 NEW
-    graph.add_node("executor_node", executor_node)  # 🔥 NEW
+    graph.add_node("planner_node", planner_node)  
+    graph.add_node("executor_node", executor_node)  
     graph.add_node("retrieval_worker", retrieval_worker)
     graph.add_node("synthesis_worker", synthesis_worker)
     graph.add_node("memory_update_worker", memory_update_worker)
@@ -731,8 +694,8 @@ def build_graph(mongo_uri: str, db_name: str = "agricultural_agent"):
         {
             "intent_router": "intent_router",
             "small_talk_worker": "small_talk_worker",
-            "planner_node": "planner_node",  # 🔥 NEW
-            "executor_node": "executor_node",  # 🔥 NEW
+            "planner_node": "planner_node",  
+            "executor_node": "executor_node",  
             "retrieval_worker": "retrieval_worker",
             "synthesis_worker": "synthesis_worker",
             "memory_update_worker": "memory_update_worker",
@@ -742,8 +705,8 @@ def build_graph(mongo_uri: str, db_name: str = "agricultural_agent"):
     
     # Edges
     graph.add_edge("small_talk_worker", END)
-    graph.add_edge("planner_node", "supervisor")  # 🔥 NEW
-    graph.add_edge("executor_node", "supervisor")  # 🔥 NEW
+    graph.add_edge("planner_node", "supervisor")  
+    graph.add_edge("executor_node", "supervisor")  
     graph.add_edge("retrieval_worker", "supervisor")
     graph.add_edge("synthesis_worker", "supervisor")
     graph.add_edge("memory_update_worker", END)
@@ -776,10 +739,10 @@ async def run_query(query: str, user_id: str, retriever,
         "user_profile": profile,
         "intent": "",
         "next_worker": "intent_router",
-        "execution_plan": [],  # 🔥 NEW
-        "current_step": 0,  # 🔥 NEW
-        "sensor_data": None,  # 🔥 NEW
-        "kb_context": None,  # 🔥 NEW
+        "execution_plan": [], 
+        "current_step": 0,  
+        "sensor_data": None,  
+        "kb_context": None,  
         "retrieved_docs": [],
         "should_stream": True,
         "requires_reflection": True,

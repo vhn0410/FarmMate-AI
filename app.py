@@ -1,10 +1,10 @@
 """
 FastAPI Application for Agricultural AI Agent
 Features:
-- ✅ Server-Sent Events (SSE) for streaming
-- ✅ Real-time response chunks
-- ✅ Conversation history
-- ✅ Health checks & monitoring
+- Server-Sent Events (SSE) for streaming
+- Real-time response chunks
+- Conversation history
+- Health checks & monitoring
 """
 
 import os
